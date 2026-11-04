@@ -1,6 +1,6 @@
 import { readFileSync } from 'node:fs';
 import type { Category, PluginConfig } from './store.js';
-import { defaultRoleIdFor, sanitizeCategory, sanitizeConfig, sanitizeDecisionProvider, sanitizeDept, sanitizeRole, sanitizeUser } from './store.js';
+import { defaultRoleIdFor, sanitizeCategory, sanitizeConfig, sanitizeDecisionProvider, sanitizeDept, sanitizeRole, sanitizeTypeSceneList, sanitizeUser } from './store.js';
 import type { LlmContext, LlmModel, LlmProvider } from './models.js';
 import { discoverModels, listProviders } from './models.js';
 import { fetchProviderModels, testProvider } from './decision.js';
@@ -403,14 +403,30 @@ export function installRpc(ctx: DshCtx, deps: RpcDeps): { install(): void; dispo
     return { profiles: store.get().modelProfiles ?? {} };
   }
 
+  function typeSceneList(): unknown {
+    return { list: [...(store.get().typeSceneList ?? [])] };
+  }
+
+  async function typeSceneSave(payload: Record<string, any> | undefined): Promise<unknown> {
+    const list = sanitizeTypeSceneList(payload?.list);
+    const config = store.get();
+    const saved = await store.save({ ...config, typeSceneList: list });
+    return { list: [...(saved.typeSceneList ?? [])] };
+  }
+
   async function modelProfileSet(payload: Record<string, any> | undefined): Promise<unknown> {
     const key = typeof payload?.key === 'string' ? payload.key.trim() : '';
     if (!key || key.length > 256) throw Object.assign(new Error('模型标识无效。'), { code: 'bad-request' });
-    const type = typeof payload?.type === 'string' ? payload.type.trim().slice(0, 40) : '';
+    const rawTypes = Array.isArray(payload?.type)
+      ? payload.type
+      : (typeof payload?.type === 'string' && payload.type.trim() ? [payload.type] : []);
+    const type = Array.from(new Set(rawTypes
+      .filter((t: unknown): t is string => typeof t === 'string' && t.trim().length > 0)
+      .map((t: string) => t.trim().slice(0, 20)))).slice(0, 5);
     const scene = typeof payload?.scene === 'string' ? payload.scene.trim().slice(0, 200) : '';
     const config = store.get();
     const next = { ...(config.modelProfiles ?? {}) };
-    if (type || scene) next[key] = { type, scene };
+    if (type.length || scene) next[key] = { type, scene };
     else delete next[key];
     const saved = await store.save({ ...config, modelProfiles: next });
     return { profiles: saved.modelProfiles ?? {} };
@@ -500,7 +516,7 @@ export function installRpc(ctx: DshCtx, deps: RpcDeps): { install(): void; dispo
     if (!updater) {
       return { current: null, latest: null, source: null, updateAvailable: false, command: null, repo: null };
     }
-    const repo = (store.get() as Record<string, unknown>)?.updateRepo;
+    const repo = store.get().updateRepo;
     const target = typeof repo === 'string' && repo.trim() ? repo.trim() : undefined;
     const current = updater.current();
     const latest = await updater.check(target);
@@ -549,6 +565,8 @@ export function installRpc(ctx: DshCtx, deps: RpcDeps): { install(): void; dispo
     if (method === 'userDefaults.set') return userDefaultsSet(payload);
     if (method === 'modelProfile.list') return modelProfileList();
     if (method === 'modelProfile.set') return modelProfileSet(payload);
+    if (method === 'typeScene.list') return typeSceneList();
+    if (method === 'typeScene.save') return typeSceneSave(payload);
     if (method === 'decision.list') return decisionList();
     if (method === 'decision.save') return decisionSave(payload);
     if (method === 'decision.delete') return decisionDelete(payload);

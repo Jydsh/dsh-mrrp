@@ -447,10 +447,13 @@ export async function resolveTargetModel(
   }
   const question = builtinModelChoiceQuestion(candidates.map((key) => {
     const parsed = parseModelKey(key);
-    // 模型画像：优先用控制台手动维护的 modelProfiles，未配置则取模型所在分类的「名称 + 描述」
+    // 模型画像：优先用控制台手动维护的 modelProfiles（type 多选数组），未配置则取模型所在分类的「名称 + 描述」
     const profile = config.modelProfiles?.[key];
     const hits = config.categories.filter((category) => category.modelIds.includes(key));
-    const type = profile?.type || hits.map((category) => category.name).join('、') || undefined;
+    const profileTypes = Array.isArray(profile?.type)
+      ? (profile.type as string[]).filter(Boolean)
+      : (typeof profile?.type === 'string' && (profile.type as string).trim() ? [(profile.type as string).trim()] : []);
+    const type = profileTypes.length ? profileTypes.join('、') : hits.map((category) => category.name).join('、') || undefined;
     const scene = profile?.scene || hits.map((category) => category.desc).filter(Boolean).join('；') || undefined;
     return { key, name: parsed ? parsed.model : key, type, scene };
   }), `发送者：${user.name || senderId}；候选授权来源：用户直接角色 ${direct.length} 个模型 / 部门继承 ${inherited.length} 个模型。`);

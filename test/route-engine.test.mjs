@@ -194,6 +194,22 @@ test('resolveTargetModel：modelProfiles 手动画像覆盖分类画像（方案
   assert.ok(captured.questions.model.criteria['dashscope:qwen-turbo'].includes('类型：紧急'));
 });
 
+test('resolveTargetModel：modelProfiles 类型多选（数组）全部带进决策问题', async () => {
+  const config = makeConfig({
+    modelProfiles: {
+      'ollama:deepseek-r1': { type: ['代码', '推理'], scene: '工程代码生成与重构' },
+      'dashscope:qwen-turbo': { type: ['对话', '快速'], scene: '日常问答与轻量任务' },
+    },
+  });
+  let captured = null;
+  const deps = depsFor(config, async () => ({ model: { response: { type: 'choice', choice: 'ollama:deepseek-r1' } } }));
+  deps.onDecide = (phase, detail) => { if (phase === 'before') captured = detail; };
+  const outcome = await resolveTargetModel(deps, config.route.imRoute, 'staff_001', '看下这张图里的代码');
+  assert.equal(outcome.model, 'ollama:deepseek-r1');
+  assert.equal(captured.questions.model.criteria['ollama:deepseek-r1'], 'deepseek-r1；类型：代码、推理；擅长：工程代码生成与重构');
+  assert.equal(captured.questions.model.criteria['dashscope:qwen-turbo'], 'qwen-turbo；类型：对话、快速；擅长：日常问答与轻量任务');
+});
+
 test('extractEvent：钉钉消息顶层 senderId + source 懒函数（实测根因修复）', () => {
   const event = {
     type: 'user/message',

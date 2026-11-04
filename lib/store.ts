@@ -178,6 +178,8 @@ export interface PluginConfig {
   userDefaults: UserDefaultsConfig;
   /** 模型手动画像（key=provider:model -> 类型/擅长场景），覆盖分类画像，供 Laya 模型路由决策使用 */
   modelProfiles: Record<string, ModelProfile>;
+  /** 类型/场景列表（模型列表「类型/擅长场景」下拉框的选项来源；可增删） */
+  typeSceneList: string[];
   /** GitHub 仓库路径（owner/repo），版本检查用；缺省使用插件默认仓库（Jydsh/dsh-mrrp） */
   updateRepo?: string;
 }
@@ -187,14 +189,27 @@ export interface UserDefaultsConfig {
   roleId: string;
 }
 
-/** 模型画像：类型 + 擅长场景（控制台「模型」页手动维护，覆盖分类画像）。 */
+/** 模型画像：类型（可多选）+ 擅长场景（控制台「模型」页手动维护，覆盖分类画像）。 */
 export interface ModelProfile {
-  type: string;
+  /** 擅长类型（多选，0~5 个）；空数组表示仅配了场景 */
+  type: string[];
   scene: string;
 }
 
 const MAX_STR = 200;
 const MAX_DESC = 500;
+
+/** 默认类型/场景列表（模型列表「类型/擅长场景」下拉框初始选项；可在「类型/场景」页增删）。 */
+export const DEFAULT_TYPE_SCENES: ReadonlyArray<string> = ['推理', '对话', '代码', '视觉', '长文本', '多模态', '工具调用', '快速', '其他'];
+
+/** 清洗类型/场景列表：字符串数组、trim、去重、上限 50；非法或空则回退默认列表。 */
+export function sanitizeTypeSceneList(value: unknown): string[] {
+  if (Array.isArray(value)) {
+    const out = cleanStringArray(value, 50);
+    if (out.length) return out;
+  }
+  return DEFAULT_TYPE_SCENES.slice();
+}
 
 export const DEFAULT_CATEGORIES: ReadonlyArray<Readonly<Omit<Category, 'id' | 'createdAt' | 'updatedAt'>>> = [
   { name: '深度推理', desc: '复杂推理 / 长链思考任务，如代码设计、逻辑分析、多步规划。', modelIds: [], isDefault: true },
@@ -233,6 +248,7 @@ export const DEFAULT_CONFIG: Readonly<PluginConfig> = Object.freeze({
   decisionProviders: [],
   userDefaults: { roleId: '' },
   modelProfiles: {},
+  typeSceneList: DEFAULT_TYPE_SCENES.slice(),
 }) as unknown as Readonly<PluginConfig>;
 
 function cleanString(value: unknown, fallback: string, max = MAX_STR): string {
@@ -488,19 +504,26 @@ export function sanitizeConfig(input: unknown): PluginConfig {
       roleId: cleanString(source.userDefaults?.roleId, '', 40),
     },
     modelProfiles: sanitizeModelProfiles(source.modelProfiles),
+    typeSceneList: sanitizeTypeSceneList(source.typeSceneList),
   };
 }
 
-/** 清洗模型画像表（key=provider:model，type/scene 任一非空才保留；上限 200 条）。 */
+/** 清洗模型画像表（key=provider:model，type/scene 任一非空才保留；上限 200 条）。
+ *  兼容旧数据：type 为字符串时归一化为单元素数组；重复项去重、上限 5 个。 */
 function sanitizeModelProfiles(value: unknown): Record<string, ModelProfile> {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return {};
   const out: Record<string, ModelProfile> = {};
   for (const [key, raw] of Object.entries(value)) {
     if (!key || key.length > 256 || out[key] || Object.keys(out).length >= 200) continue;
     const rec = (raw && typeof raw === 'object' ? raw : {}) as Record<string, any>;
-    const type = typeof rec.type === 'string' ? rec.type.trim().slice(0, 40) : '';
+    const rawTypes = Array.isArray(rec.type)
+      ? rec.type
+      : (typeof rec.type === 'string' && rec.type.trim() ? [rec.type] : []);
+    const type = Array.from(new Set(rawTypes
+      .filter((t: unknown): t is string => typeof t === 'string' && t.trim().length > 0)
+      .map((t: string) => t.trim().slice(0, 20)))).slice(0, 5);
     const scene = typeof rec.scene === 'string' ? rec.scene.trim().slice(0, 200) : '';
-    if (type || scene) out[key] = { type, scene };
+    if (type.length || scene) out[key] = { type, scene };
   }
   return out;
 }
