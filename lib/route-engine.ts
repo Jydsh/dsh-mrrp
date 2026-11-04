@@ -1,6 +1,20 @@
 import type { CategoryBinding, ImRouteConfig, ImRouteQuestion, PluginConfig } from './store.js';
 import { makeLayaDecide } from './decision.js';
-import { readFileSync, writeFileSync } from 'node:fs';
+import { readFileSync, readdirSync, unlinkSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
+
+/** 按天路由决策日志文件名：route-decision-YYYY-MM-DD.log（多人共用、按天分文件，避免单文件臃肿）。 */
+export function routeLogFileName(now: Date = new Date()): string {
+  const y = now.getFullYear();
+  const m = String(now.getMonth() + 1).padStart(2, '0');
+  const d = String(now.getDate()).padStart(2, '0');
+  return `route-decision-${y}-${m}-${d}.log`;
+}
+
+/** 当天路由决策日志文件绝对路径（baseDir 为 config.json 所在目录）。 */
+export function routeLogPathFor(baseDir: string, now: Date = new Date()): string {
+  return join(baseDir, routeLogFileName(now));
+}
 
 /**
  * MRRP 决策模型路由（新方案：adapter 暴露虚拟模型 + 按用户权限决策真实模型）。
@@ -751,6 +765,32 @@ export function pruneRouteLogFile(logPath: string, maxAgeDays: number, now: numb
     writeFileSync(logPath, kept.join('\n'), 'utf8');
   } catch {
     return 0;
+  }
+  return removed;
+}
+
+/** 清理按天路由决策日志：删除 baseDir 下「文件名日期早于 maxAgeDays 天」的 route-decision-YYYY-MM-DD.log。
+ *  文件不存在 / 读取失败 / 无匹配文件均静默返回 0；返回删除的文件数。 */
+export function pruneRouteLogDir(baseDir: string, maxAgeDays: number, now: number = Date.now()): number {
+  if (!baseDir || !(maxAgeDays > 0)) return 0;
+  const cutoff = now - maxAgeDays * 24 * 60 * 60 * 1000;
+  const nameRe = /^route-decision-(\d{4})-(\d{2})-(\d{2})\.log$/;
+  let names: string[] = [];
+  try {
+    names = readdirSync(baseDir);
+  } catch {
+    return 0;
+  }
+  let removed = 0;
+  for (const name of names) {
+    const m = nameRe.exec(name);
+    if (!m) continue;
+    const fileDate = new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3])).getTime();
+    if (!Number.isFinite(fileDate) || fileDate >= cutoff) continue;
+    try {
+      unlinkSync(join(baseDir, name));
+      removed += 1;
+    } catch { /* 删除失败静默跳过，不影响其它文件 */ }
   }
   return removed;
 }

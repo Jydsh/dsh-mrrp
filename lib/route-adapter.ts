@@ -1,7 +1,7 @@
 import { appendFileSync } from 'node:fs';
 import type { ImRouteConfig, PluginConfig } from './store.js';
 import type { ImRoutingDeps, ImRoutingHandle } from './route-engine.js';
-import { extractDecisionValues, parseModelKey, pruneRouteLogFile, resolveTargetModel } from './route-engine.js';
+import { extractDecisionValues, parseModelKey, pruneRouteLogDir, pruneRouteLogFile, resolveTargetModel, routeLogPathFor } from './route-engine.js';
 
 /**
  * MRRP 决策模型路由 adapter（新方案核心）。
@@ -58,11 +58,11 @@ export interface RouteAdapterDeps {
   /** 宽松日志器 */
   logger?: { info?: (...args: unknown[]) => void; warn?: (...args: unknown[]) => void; error?: (...args: unknown[]) => void };
   /**
-   * 路由决策日志文件路径（append JSON 行）。记录每次生成请求的完整路由链路：
-   * 会话 / 发送者 / 用户命中 / 候选池 / 发送给 laya 的请求与响应 / 最终模型与来源。
+   * 路由决策日志目录（与 config.json 同目录）。按天分文件写入 route-decision-YYYY-MM-DD.log（append JSON 行），
+   * 记录每次生成请求的完整路由链路：会话 / 发送者 / 用户命中 / 候选池 / 发送给 laya 的请求与响应 / 最终模型与来源。
    * 不配置时仅走 logger（宿主日志）。
    */
-  logPath?: string;
+  logDir?: string;
 }
 
 function isRecord(value: unknown): value is Record<string, any> {
@@ -73,27 +73,32 @@ function warn(deps: RouteAdapterDeps, message: string, ...args: unknown[]): void
   try { deps.logger?.warn?.(`[dsh-mrrp:route-adapter] ${message}`, ...args); } catch { /* ignore */ }
 }
 
-/** 路由决策日志：追加 JSON 行到 logPath（若配置），同时透传宿主 logger.info。 */
+/** 路由决策日志：追加 JSON 行到当天按天日志文件（若配置），同时透传宿主 logger.info。 */
 function routeLog(deps: RouteAdapterDeps, entry: Record<string, unknown>): void {
   const line = JSON.stringify({ ts: new Date().toISOString(), ...entry });
-  if (deps.logPath) {
-    try { appendFileSync(deps.logPath, `${line}\n`, 'utf8'); } catch (error) {
-      warn(deps, `路由决策日志写入失败（${deps.logPath}）：${(error as Error)?.message ?? error}`);
+  if (deps.logDir) {
+    const logPath = routeLogPathFor(deps.logDir);
+    try { appendFileSync(logPath, `${line}\n`, 'utf8'); } catch (error) {
+      warn(deps, `路由决策日志写入失败（${logPath}）：${(error as Error)?.message ?? error}`);
     }
-    maybePruneLog(deps.logPath);
+    maybePruneLog(deps);
   }
   try { deps.logger?.info?.('[dsh-mrrp:route]', line); } catch { /* ignore */ }
 }
 
-/** 日志清理节流：默认 6 小时最多执行一次「删除超过 30 天日志行」，避免每次写入都全文件扫描。 */
+/** 日志清理节流：默认 6 小时最多执行一次「删除超过保留天数的历史按天日志文件 + 当天文件内过期行」，
+ *  避免每次写入都全文件扫描。保留天数取配置 logRetentionDays（默认 30，1~365）。 */
 const ROUTE_LOG_PRUNE_INTERVAL_MS = 6 * 60 * 60 * 1000;
-const ROUTE_LOG_MAX_AGE_DAYS = 30;
 let lastRouteLogPruneAt = 0;
-function maybePruneLog(logPath: string): void {
+function maybePruneLog(deps: RouteAdapterDeps): void {
+  const logDir = deps.logDir;
+  if (!logDir) return;
   const now = Date.now();
   if (now - lastRouteLogPruneAt < ROUTE_LOG_PRUNE_INTERVAL_MS) return;
   lastRouteLogPruneAt = now;
-  try { pruneRouteLogFile(logPath, ROUTE_LOG_MAX_AGE_DAYS, now); } catch { /* 清理失败不影响路由 */ }
+  const maxAgeDays = deps.getConfig().logRetentionDays || 30;
+  try { pruneRouteLogDir(logDir, maxAgeDays, now); } catch { /* 清理失败不影响路由 */ }
+  try { pruneRouteLogFile(routeLogPathFor(logDir), maxAgeDays, now); } catch { /* 清理失败不影响路由 */ }
 }
 
 /** 从生成请求中提取「最后一条用户消息」文本（供决策模型判断任务内容）。 */

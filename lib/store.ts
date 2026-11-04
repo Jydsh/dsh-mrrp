@@ -180,6 +180,8 @@ export interface PluginConfig {
   modelProfiles: Record<string, ModelProfile>;
   /** 类型/场景列表（模型列表「类型/擅长场景」下拉框的选项来源；可增删） */
   typeSceneList: string[];
+  /** 路由决策日志自动清理保留天数（1~365，默认 30） */
+  logRetentionDays: number;
   /** GitHub 仓库路径（owner/repo），版本检查用；缺省使用插件默认仓库（Jydsh/dsh-mrrp） */
   updateRepo?: string;
 }
@@ -249,6 +251,7 @@ export const DEFAULT_CONFIG: Readonly<PluginConfig> = Object.freeze({
   userDefaults: { roleId: '' },
   modelProfiles: {},
   typeSceneList: DEFAULT_TYPE_SCENES.slice(),
+  logRetentionDays: 30,
 }) as unknown as Readonly<PluginConfig>;
 
 function cleanString(value: unknown, fallback: string, max = MAX_STR): string {
@@ -259,6 +262,13 @@ function cleanString(value: unknown, fallback: string, max = MAX_STR): string {
 
 function cleanBool(value: unknown, fallback: boolean): boolean {
   return typeof value === 'boolean' ? value : fallback;
+}
+
+/** 整数清洗：数值取整并 clamp 到 [min, max]，非法回退 fallback。 */
+function cleanInt(value: unknown, fallback: number, min: number, max: number): number {
+  const num = Number(value);
+  if (!Number.isFinite(num)) return fallback;
+  return Math.min(max, Math.max(min, Math.round(num)));
 }
 
 function cleanId(value: unknown, prefix: string): string {
@@ -505,6 +515,7 @@ export function sanitizeConfig(input: unknown): PluginConfig {
     },
     modelProfiles: sanitizeModelProfiles(source.modelProfiles),
     typeSceneList: sanitizeTypeSceneList(source.typeSceneList),
+    logRetentionDays: cleanInt(source.logRetentionDays, 30, 1, 365),
   };
 }
 

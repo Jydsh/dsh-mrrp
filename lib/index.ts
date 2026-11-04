@@ -1,10 +1,10 @@
 import { appendFileSync } from 'node:fs';
-import { dirname, join } from 'node:path';
+import { dirname } from 'node:path';
 import { installRpc, type DshCtx } from './rpc.js';
 import { MrrpConfigStore } from './store.js';
 import { makeLayaDecide } from './decision.js';
 import { makeImReader } from './dshim.js';
-import { createImRouting, pruneRouteLogFile } from './route-engine.js';
+import { createImRouting, pruneRouteLogDir, pruneRouteLogFile, routeLogPathFor } from './route-engine.js';
 import { readDingtalkBridgeSessions } from './dingtalk-bridge.js';
 import { createRouteAdapter } from './route-adapter.js';
 import { checkLatestVersion, getCurrentVersion, isAtLeast } from './updater.js';
@@ -64,9 +64,9 @@ function makeLogger(ctx: DshContext): DshLogger {
   };
 }
 
-/** 路由诊断日志器：写 route-decision.log（append JSON 行）并透传宿主 logger。
- *  供会话发送者观测（im-route）使用，与 adapter 的路由决策日志共用同一文件。 */
-function makeRouteLogger(logPath: string, host: DshLogger): DshLogger {
+/** 路由诊断日志器：写当天按天日志文件（route-decision-YYYY-MM-DD.log，append JSON 行）并透传宿主 logger。
+ *  供会话发送者观测（im-route）使用，与 adapter 的路由决策日志共用同一文件（按天分文件）。 */
+function makeRouteLogger(logDir: string, host: DshLogger): DshLogger {
   const emit = (level: string, args: unknown[]): void => {
     let message = '';
     for (const arg of args) {
@@ -74,7 +74,7 @@ function makeRouteLogger(logPath: string, host: DshLogger): DshLogger {
         + (typeof arg === 'string' ? arg : safeJson(arg));
     }
     const line = JSON.stringify({ ts: new Date().toISOString(), scope: 'im-route', level, message });
-    try { appendFileSync(logPath, `${line}\n`, 'utf8'); } catch { /* 写失败不阻塞主链路 */ }
+    try { appendFileSync(routeLogPathFor(logDir), `${line}\n`, 'utf8'); } catch { /* 写失败不阻塞主链路 */ }
     try { (host as unknown as Record<string, (...args: unknown[]) => void>)?.[level]?.(`[dsh-mrrp:im-route]`, ...args); } catch { /* ignore */ }
   };
   return {
@@ -92,14 +92,18 @@ function safeJson(value: unknown): string {
 export async function apply(ctx: DshContext, config: ApplyConfig = {}): Promise<void> {
   const logger = makeLogger(ctx);
   const store = new MrrpConfigStore(config.configPath);
-  // 路由决策日志：与 config.json 同目录的 route-decision.log（append JSON 行）
-  const routeLogPath = join(dirname(store.path), 'route-decision.log');
-  // 会话发送者观测日志：写 route-decision.log（与 adapter 共用），宿主 logger 透传。
-  const routeLogger = makeRouteLogger(routeLogPath, logger);
+  // 路由决策日志目录：与 config.json 同目录，按天分文件（route-decision-YYYY-MM-DD.log，append JSON 行）
+  const routeLogDir = dirname(store.path);
+  // 会话发送者观测日志：写当天日志文件（与 adapter 共用），宿主 logger 透传。
+  const routeLogger = makeRouteLogger(routeLogDir, logger);
   try {
     await store.load();
-    // 启动时清理一次路由决策日志（删除超过 30 天的行；失败静默不影响启动）
-    try { pruneRouteLogFile(routeLogPath, 30); } catch { /* ignore */ }
+    // 启动时清理一次路由决策日志（删除超过保留天数的历史按天文件 + 当天文件内过期行；失败静默不影响启动）
+    try {
+      const retention = store.get().logRetentionDays || 30;
+      pruneRouteLogDir(routeLogDir, retention);
+      pruneRouteLogFile(routeLogPathFor(routeLogDir), retention);
+    } catch { /* ignore */ }
   } catch (error) {
     logger.error?.('[dsh-mrrp] failed to load config, using defaults:', (error as Error)?.message ?? error);
   }
@@ -134,8 +138,8 @@ export async function apply(ctx: DshContext, config: ApplyConfig = {}): Promise<
         registry: imRouting,
         host: { llm, logger },
         logger,
-        // 路由决策日志：与 config.json 同目录的 route-decision.log（append JSON 行）
-        logPath: routeLogPath,
+        // 路由决策日志：与 config.json 同目录，按天分文件（append JSON 行）
+        logDir: routeLogDir,
       });
       adapterRegistration = llm.registerAdapter(['mrrp'], adapter);
       logger.info?.('[dsh-mrrp] 决策模型路由 adapter 已注册：对话模型列表可选中「MRRP 智能路由」');
@@ -149,7 +153,7 @@ export async function apply(ctx: DshContext, config: ApplyConfig = {}): Promise<
   const rpc = installRpc(ctx, {
     store, llm, logger, im,
     imRoutingStatus: () => imRouting.status(),
-    logPath: routeLogPath,
+    logDir: routeLogDir,
     updater: { current: getCurrentVersion, check: checkLatestVersion, isAtLeast },
   });
   try {

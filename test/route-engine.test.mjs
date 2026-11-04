@@ -12,7 +12,10 @@ import {
   extractEvent,
   flattenUserModels,
   parseModelKey,
+  pruneRouteLogDir,
   pruneRouteLogFile,
+  routeLogFileName,
+  routeLogPathFor,
   sessionIdOf,
   builtinModelChoiceQuestion,
   resolveTargetModel,
@@ -584,4 +587,35 @@ test('pruneRouteLogFile：文件不存在 / 参数非法时返回 0 不抛错', 
   assert.equal(pruneRouteLogFile('', 30), 0);
   assert.equal(pruneRouteLogFile('/some/path.log', 0), 0);
   assert.equal(pruneRouteLogFile('/some/path.log', -1), 0);
+});
+
+test('routeLogFileName / routeLogPathFor：按天命名 route-decision-YYYY-MM-DD.log', () => {
+  assert.equal(routeLogFileName(new Date(2026, 10, 4)), 'route-decision-2026-11-04.log');
+  assert.equal(routeLogFileName(new Date(2026, 0, 9)), 'route-decision-2026-01-09.log');
+  assert.equal(routeLogPathFor('C:/logs', new Date(2026, 6, 1)), join('C:/logs', 'route-decision-2026-07-01.log'));
+});
+
+test('pruneRouteLogDir：删除超过保留天数的按天文件，保留近期文件与无关文件', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'mrrp-prune-dir-'));
+  const day = 24 * 60 * 60 * 1000;
+  const now = Date.now();
+  const old = join(dir, routeLogFileName(new Date(now - 40 * day)));
+  const fresh = join(dir, routeLogFileName(new Date(now - 1 * day)));
+  const today = join(dir, routeLogFileName(new Date(now)));
+  const other = join(dir, 'unrelated.txt');
+  writeFileSync(old, 'x\n');
+  writeFileSync(fresh, 'x\n');
+  writeFileSync(today, 'x\n');
+  writeFileSync(other, 'x\n');
+
+  const removed = pruneRouteLogDir(dir, 30, now);
+  assert.equal(removed, 1, '只删除 40 天前的按天文件');
+  assert.equal(readFileSync(fresh, 'utf8'), 'x\n');
+  assert.equal(readFileSync(today, 'utf8'), 'x\n');
+  assert.equal(readFileSync(other, 'utf8'), 'x\n');
+
+  // 目录不存在 / 参数非法返回 0
+  assert.equal(pruneRouteLogDir(join(dir, 'nope'), 30), 0);
+  assert.equal(pruneRouteLogDir('', 30), 0);
+  rmSync(dir, { recursive: true, force: true });
 });

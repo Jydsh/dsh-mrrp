@@ -1,6 +1,6 @@
 import { test, before } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -41,9 +41,11 @@ let registrations;
 let provided;
 let store;
 let imSenders;
+let cfgDir;       // apply 装配的临时 config 目录（即日志目录）
 
 before(async () => {
   const dir = mkdtempSync(join(tmpdir(), 'mrrp-rpc-'));
+  cfgDir = dir;
   // 注入内存 fake dsh-im 读取器：用例通过 insertImSender 填充，不依赖真实用户文件系统。
   const imSendersLocal = new Map();
   const fakeIm = {
@@ -402,4 +404,69 @@ test('decision.fetch 非法地址提示协议', async () => {
   const r = await rpc('decision.fetch', { provider: { format: 'openai', baseUrl: 'localhost:8000' } });
   assert.equal(r.ok, false);
   assert.match(r.error.message, /http/);
+});
+
+test('logs.files.list / logs.file.read / logs.file.clear / logs.file.prune：按天文件管理', async () => {
+  const today = new Date();
+  const pad = (n) => String(n).padStart(2, '0');
+  const name = `route-decision-${today.getFullYear()}-${pad(today.getMonth() + 1)}-${pad(today.getDate())}.log`;
+  const file = join(cfgDir, name);
+  const day = 24 * 60 * 60 * 1000;
+  const now = Date.now();
+  const oldLine = JSON.stringify({ ts: new Date(now - 40 * day).toISOString(), scope: 'route', event: 'route', model: 'a', message: 'keep me' });
+  const freshLine = JSON.stringify({ ts: new Date(now - 1 * day).toISOString(), scope: 'route', event: 'route', model: 'b', message: 'drop me' });
+  const badLine = 'not-json {{';
+  writeFileSync(file, `${oldLine}\n${freshLine}\n${badLine}\n`, 'utf8');
+  const legacy = join(cfgDir, 'route-decision.log');
+  writeFileSync(legacy, `${freshLine}\n`, 'utf8');
+
+  // 列表：按天文件 + 旧版文件都在
+  const list = await rpc('logs.files.list');
+  assert.equal(list.ok, true);
+  const files = list.value.files;
+  assert.ok(files.some((f) => f.name === name), '按天文件在列表中');
+  assert.ok(files.some((f) => f.name === 'route-decision.log'), '旧版文件也在列表中');
+  assert.equal(files.find((f) => f.name === name).lineCount, 3);
+
+  // 读取：最新（最后写入的坏行）在前，坏行 data 为 null，total 含坏行
+  const rd = await rpc('logs.file.read', { name });
+  assert.equal(rd.ok, true);
+  assert.equal(rd.value.total, 3);
+  assert.equal(rd.value.rows.length, 3);
+  assert.equal(rd.value.rows[0].data, null, '最新写入的是坏行，data 为 null');
+  assert.ok(rd.value.rows.some((r) => r.data && r.data.model === 'b'), 'fresh 行可解析');
+
+  // 勾选删除：按原始行文本精确删除 fresh 行
+  const freshRaw = rd.value.rows.find((r) => r.data && r.data.model === 'b').raw;
+  const drop = await rpc('logs.file.dropRows', { name, raws: [freshRaw] });
+  assert.equal(drop.ok, true);
+  assert.equal(drop.value.removed, 1);
+  assert.equal((await rpc('logs.file.read', { name })).value.total, 2);
+
+  // 条件清理：beforeTs（40 天前行）+ dropKeyword 叠加（此时只剩 old 过期行 + 坏行）
+  const pr = await rpc('logs.file.prune', { name, beforeTs: now - 30 * day, dropKeyword: 'zzz-none' });
+  assert.equal(pr.ok, true);
+  assert.equal(pr.value.removed, 1);
+  assert.equal((await rpc('logs.file.read', { name })).value.total, 1);
+
+  // keepKeyword：只保留含 keep 的行（坏行不含 keep 被删）
+  assert.equal((await rpc('logs.file.prune', { name, keepKeyword: 'keep' })).value.removed, 1);
+
+  // 删除整个文件（此时文件已空）
+  const cl = await rpc('logs.file.clear', { name });
+  assert.equal(cl.ok, true);
+  assert.equal(cl.value.removed, 0);
+  const list2 = await rpc('logs.files.list');
+  assert.equal(list2.value.files.some((f) => f.name === name), false, '删除后不在列表');
+
+  // 防路径穿越：非法文件名一律拒绝
+  const evil = await rpc('logs.file.read', { name: '../config.json' });
+  assert.equal(evil.ok, true);
+  assert.equal(evil.value.path, '');
+  assert.equal(evil.value.rows.length, 0);
+
+  // 空条件 prune 不删
+  assert.equal((await rpc('logs.file.prune', { name: 'route-decision.log' })).value.removed, 0);
+
+  rmSync(cfgDir, { recursive: true, force: true });
 });

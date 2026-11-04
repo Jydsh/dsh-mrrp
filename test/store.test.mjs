@@ -102,6 +102,20 @@ test('sanitizeRoute 钳制超时与重试', () => {
   assert.equal(r.lb, DEFAULT_CONFIG.route.lb);
 });
 
+test('sanitizeConfig logRetentionDays 钳制 1~365，缺省 30', () => {
+  assert.equal(sanitizeConfig({}).logRetentionDays, 30);
+  assert.equal(sanitizeConfig({ logRetentionDays: 0 }).logRetentionDays, 1);
+  assert.equal(sanitizeConfig({ logRetentionDays: 999 }).logRetentionDays, 365);
+  assert.equal(sanitizeConfig({ logRetentionDays: 7.6 }).logRetentionDays, 8);
+  assert.equal(sanitizeConfig({ logRetentionDays: 'bogus' }).logRetentionDays, 30);
+});
+
+test('sanitizeConfig typeSceneList 非法/空回退默认，合法数组去重截断', () => {
+  assert.deepEqual(sanitizeConfig({}).typeSceneList, ['推理', '对话', '代码', '视觉', '长文本', '多模态', '工具调用', '快速', '其他']);
+  assert.deepEqual(sanitizeConfig({ typeSceneList: 'x' }).typeSceneList, ['推理', '对话', '代码', '视觉', '长文本', '多模态', '工具调用', '快速', '其他']);
+  assert.deepEqual(sanitizeConfig({ typeSceneList: ['代码', ' 代码 ', '推理', '', 3] }).typeSceneList, ['代码', '推理']);
+});
+
 test('MrrpConfigStore load 空文件回退默认配置', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'mrrp-store-'));
   const path = join(dir, 'config.json');

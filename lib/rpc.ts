@@ -1,10 +1,12 @@
-import { readFileSync } from 'node:fs';
+import { readFileSync, readdirSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
 import type { Category, PluginConfig } from './store.js';
 import { defaultRoleIdFor, sanitizeCategory, sanitizeConfig, sanitizeDecisionProvider, sanitizeDept, sanitizeRole, sanitizeTypeSceneList, sanitizeUser } from './store.js';
 import type { LlmContext, LlmModel, LlmProvider } from './models.js';
 import { discoverModels, listProviders } from './models.js';
 import { fetchProviderModels, testProvider } from './decision.js';
 import { noopImReader, type ImReader } from './dshim.js';
+import { routeLogPathFor } from './route-engine.js';
 
 /**
  * RPC 消息契约（lib/client.js ↔ server 管理通道）。
@@ -73,8 +75,8 @@ export interface RpcDeps {
   im?: ImReader;
   /** IM 消息路由引擎状态查询（route.im.status 用；缺省返回未订阅） */
   imRoutingStatus?: () => Record<string, unknown>;
-  /** 路由决策日志文件路径（logs.read 用；未提供则返回空） */
-  logPath?: string;
+  /** 路由决策日志目录（logs.read / logs.settings / logs.clear 用；按天分文件 route-decision-YYYY-MM-DD.log） */
+  logDir?: string;
   /** 版本检查器（version.check 用；未提供则返回空信息） */
   updater?: {
     current(): string | null;
@@ -485,11 +487,11 @@ export function installRpc(ctx: DshCtx, deps: RpcDeps): { install(): void; dispo
     return testProvider(provider);
   }
 
-  /** 读取路由决策日志（route-decision.log，append JSON 行），返回最新在前、最多 limit 条。 */
+  /** 读取当天路由决策日志（route-decision-YYYY-MM-DD.log，append JSON 行），返回最新在前、最多 limit 条。 */
   function logsRead(payload: Record<string, any> | undefined): { logs: Record<string, unknown>[]; path: string } {
     const want = typeof payload?.limit === 'number' && Number.isFinite(payload.limit) ? Math.floor(payload.limit) : 200;
     const cap = Math.max(1, Math.min(want, 1000));
-    const path = deps.logPath ?? '';
+    const path = deps.logDir ? routeLogPathFor(deps.logDir) : '';
     if (!path) return { logs: [], path };
     let text = '';
     try {
@@ -507,6 +509,198 @@ export function installRpc(ctx: DshCtx, deps: RpcDeps): { install(): void; dispo
     }
     rows.reverse(); // 最新在前
     return { logs: rows, path };
+  }
+
+  /** 日志设置读取：保留天数（logRetentionDays）+ 当天日志文件路径 / 大小 / 行数 / 历史文件数。 */
+  function logsSettingsGet(): { retentionDays: number; path: string; bytes: number; lineCount: number; files: number } {
+    const retentionDays = store.get().logRetentionDays || 30;
+    const dir = deps.logDir ?? '';
+    const path = dir ? routeLogPathFor(dir) : '';
+    let bytes = 0;
+    let lineCount = 0;
+    let files = 0;
+    if (path) {
+      try {
+        const text = readFileSync(path, 'utf8');
+        bytes = Buffer.byteLength(text);
+        lineCount = text.split('\n').filter((line) => line.trim()).length;
+      } catch { /* 当天日志文件尚不存在：视为 0 */ }
+    }
+    if (dir) {
+      try {
+        files = readdirSync(dir).filter((name) => /^route-decision.*\.log$/.test(name)).length;
+      } catch { /* 目录不可读：视为 0 */ }
+    }
+    return { retentionDays, path, bytes, lineCount, files };
+  }
+
+  /** 日志设置保存：更新自动清理保留天数（1~365，取整）。 */
+  async function logsSettingsSet(payload: Record<string, any> | undefined): Promise<{ retentionDays: number }> {
+    const raw = Number(payload?.retentionDays);
+    const days = Number.isFinite(raw) ? Math.min(365, Math.max(1, Math.round(raw))) : 30;
+    const config = store.get();
+    const saved = await store.save({ ...config, logRetentionDays: days });
+    return { retentionDays: saved.logRetentionDays || 30 };
+  }
+
+  /** 清空全部路由决策日志：删除目录下所有按天日志文件（route-decision-YYYY-MM-DD.log）与旧版 route-decision.log，
+   *  返回删除的行数与文件数。 */
+  function logsClear(): { removed: number; files: number; path: string } {
+    const dir = deps.logDir ?? '';
+    if (!dir) return { removed: 0, files: 0, path: '' };
+    let names: string[] = [];
+    try { names = readdirSync(dir); } catch { return { removed: 0, files: 0, path: dir }; }
+    let removed = 0;
+    let files = 0;
+    for (const name of names) {
+      if (!/^route-decision.*\.log$/.test(name)) continue;
+      const full = join(dir, name);
+      try {
+        const text = readFileSync(full, 'utf8');
+        removed += text.split('\n').filter((line) => line.trim()).length;
+        unlinkSync(full);
+        files += 1;
+      } catch { /* 单个文件删除失败静默跳过，不影响其它文件 */ }
+    }
+    return { removed, files, path: dir };
+  }
+
+  /** 仅允许操作本插件日志文件名（route-decision*.log），防止路径穿越。 */
+  function logsFileNameOf(payload: Record<string, any> | undefined): string {
+    const name = typeof payload?.name === 'string' ? payload.name.trim() : '';
+    return /^route-decision[^\\/]*\.log$/.test(name) ? name : '';
+  }
+
+  /** 列出全部路由决策日志文件（当天 + 历史 route-decision*.log）：名称 / 路径 / 大小 / 条数 / 修改时间。 */
+  function logsFilesList(): { files: { name: string; path: string; bytes: number; lineCount: number; mtime: number }[] } {
+    const dir = deps.logDir ?? '';
+    if (!dir) return { files: [] };
+    let names: string[] = [];
+    try { names = readdirSync(dir); } catch { return { files: [] }; }
+    const files: { name: string; path: string; bytes: number; lineCount: number; mtime: number }[] = [];
+    for (const name of names) {
+      if (!/^route-decision[^\\/]*\.log$/.test(name)) continue;
+      const full = join(dir, name);
+      try {
+        const text = readFileSync(full, 'utf8');
+        files.push({
+          name,
+          path: full,
+          bytes: Buffer.byteLength(text),
+          lineCount: text.split('\n').filter((line) => line.trim()).length,
+          mtime: statSync(full).mtimeMs,
+        });
+      } catch { /* 单文件不可读则跳过 */ }
+    }
+    files.sort((a, b) => b.mtime - a.mtime); // 最新在前
+    return { files };
+  }
+
+  /** 读取指定日志文件的记录（最新在前、最多 limit 条）。
+   *  返回 rows: [{ raw: 原始行文本, data: 解析后的 JSON 对象（坏行 data 为 null）}]，raw 可用于按行删除。 */
+  function logsFileRead(payload: Record<string, any> | undefined): { name: string; path: string; rows: { raw: string; data: Record<string, unknown> | null }[]; total: number } {
+    const name = logsFileNameOf(payload);
+    const dir = deps.logDir ?? '';
+    if (!name || !dir) return { name, path: '', rows: [], total: 0 };
+    const full = join(dir, name);
+    let text = '';
+    try { text = readFileSync(full, 'utf8'); } catch { return { name, path: full, rows: [], total: 0 }; }
+    const lines = text.split('\n').filter((line) => line.trim());
+    const rows: { raw: string; data: Record<string, unknown> | null }[] = lines.map((line) => {
+      let data: Record<string, unknown> | null = null;
+      try {
+        const parsed = JSON.parse(line) as Record<string, unknown> | null;
+        if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) data = parsed;
+      } catch { /* 坏行：data 保持 null */ }
+      return { raw: line, data };
+    });
+    const want = typeof payload?.limit === 'number' && Number.isFinite(payload.limit) ? Math.floor(payload.limit) : 200;
+    const cap = Math.max(1, Math.min(want, 1000));
+    const tail = rows.slice(-cap).reverse(); // 最新在前
+    return { name, path: full, rows: tail, total: rows.length };
+  }
+
+  /** 按原始行文本删除指定日志文件中的记录（勾选删除），返回删除行数。 */
+  function logsFileDropRows(payload: Record<string, any> | undefined): { name: string; removed: number } {
+    const name = logsFileNameOf(payload);
+    const dir = deps.logDir ?? '';
+    if (!name || !dir) return { name, removed: 0 };
+    const raws = Array.isArray(payload?.raws) ? payload.raws.filter((s) => typeof s === 'string' && s.trim()) : [];
+    if (!raws.length) return { name, removed: 0 };
+    const full = join(dir, name);
+    let text = '';
+    try { text = readFileSync(full, 'utf8'); } catch { return { name, removed: 0 }; }
+    const dropSet = new Set(raws.map((r) => r.trim()));
+    const lines = text.split('\n');
+    const kept: string[] = [];
+    let removed = 0;
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (!trimmed) continue;
+      if (dropSet.has(trimmed)) { removed += 1; continue; }
+      kept.push(line);
+    }
+    try {
+      writeFileSync(full, kept.length ? kept.join('\n') + '\n' : '', 'utf8');
+    } catch { return { name, removed: 0 }; }
+    return { name, removed };
+  }
+
+  /** 删除指定日志文件（整文件），返回删除的行数。 */
+  function logsFileClear(payload: Record<string, any> | undefined): { name: string; removed: number } {
+    const name = logsFileNameOf(payload);
+    const dir = deps.logDir ?? '';
+    if (!name || !dir) return { name, removed: 0 };
+    const full = join(dir, name);
+    let removed = 0;
+    try {
+      const text = readFileSync(full, 'utf8');
+      removed = text.split('\n').filter((line) => line.trim()).length;
+      unlinkSync(full);
+    } catch { /* 不存在 / 删除失败：返回 0，不影响主链路 */ }
+    return { name, removed };
+  }
+
+  /** 按条件清理指定日志文件的记录（可同时叠加）：
+   *  beforeTs：删除 ts 早于该毫秒时间戳的行（如「保留最近 N 天」）；
+   *  dropKeyword：删除 message/detail 含该关键词的行；
+   *  keepKeyword：只保留 message/detail 含该关键词的行。返回删除行数。 */
+  function logsFilePrune(payload: Record<string, any> | undefined): { name: string; removed: number } {
+    const name = logsFileNameOf(payload);
+    const dir = deps.logDir ?? '';
+    if (!name || !dir) return { name, removed: 0 };
+    const full = join(dir, name);
+    const beforeTs = typeof payload?.beforeTs === 'number' && Number.isFinite(payload.beforeTs) ? payload.beforeTs : NaN;
+    const dropKeyword = typeof payload?.dropKeyword === 'string' && payload.dropKeyword.trim() ? payload.dropKeyword.trim() : '';
+    const keepKeyword = typeof payload?.keepKeyword === 'string' && payload.keepKeyword.trim() ? payload.keepKeyword.trim() : '';
+    if (!Number.isFinite(beforeTs) && !dropKeyword && !keepKeyword) return { name, removed: 0 };
+    let text = '';
+    try { text = readFileSync(full, 'utf8'); } catch { return { name, removed: 0 }; }
+    const lines = text.split('\n');
+    const kept: string[] = [];
+    let removed = 0;
+    for (const line of lines) {
+      if (!line.trim()) continue;
+      let ts = NaN;
+      let body = line;
+      try {
+        const parsed = JSON.parse(line) as Record<string, unknown> | null;
+        if (parsed && typeof parsed === 'object') {
+          const rawTs = parsed.ts;
+          ts = typeof rawTs === 'string' ? new Date(rawTs).getTime() : Number(rawTs);
+          body = String(parsed.message ?? '') + String(parsed.detail ?? '') + JSON.stringify(parsed);
+        }
+      } catch { /* 坏行按原始文本参与关键词判断 */ }
+      const expired = Number.isFinite(beforeTs) && Number.isFinite(ts) && ts < beforeTs;
+      const dropHit = dropKeyword && body.includes(dropKeyword);
+      const keepMiss = keepKeyword && !body.includes(keepKeyword);
+      if (expired || dropHit || keepMiss) { removed += 1; continue; }
+      kept.push(line);
+    }
+    try {
+      writeFileSync(full, kept.length ? kept.join('\n') + '\n' : '', 'utf8');
+    } catch { return { name, removed: 0 }; }
+    return { name, removed };
   }
 
   /** 版本检查：对比当前插件版本与 GitHub 最新 Release，返回更新引导命令。
@@ -573,6 +767,14 @@ export function installRpc(ctx: DshCtx, deps: RpcDeps): { install(): void; dispo
     if (method === 'decision.fetch') return decisionFetch(payload);
     if (method === 'decision.test') return decisionTest(payload);
     if (method === 'logs.read') return logsRead(payload);
+    if (method === 'logs.settings.get') return logsSettingsGet();
+    if (method === 'logs.settings.set') return logsSettingsSet(payload);
+    if (method === 'logs.clear') return logsClear();
+    if (method === 'logs.files.list') return logsFilesList();
+    if (method === 'logs.file.read') return logsFileRead(payload);
+    if (method === 'logs.file.dropRows') return logsFileDropRows(payload);
+    if (method === 'logs.file.clear') return logsFileClear(payload);
+    if (method === 'logs.file.prune') return logsFilePrune(payload);
     if (method === 'version.check') return versionCheck();
     throw Object.assign(new Error(`未知操作：${method}`), { code: 'unknown-method' });
   }
