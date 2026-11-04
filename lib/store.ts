@@ -178,6 +178,8 @@ export interface PluginConfig {
   userDefaults: UserDefaultsConfig;
   /** 模型手动画像（key=provider:model -> 类型/擅长场景），覆盖分类画像，供 Laya 模型路由决策使用 */
   modelProfiles: Record<string, ModelProfile>;
+  /** GitHub 仓库路径（owner/repo），版本检查用；缺省使用插件默认仓库（Jydsh/dsh-mrrp） */
+  updateRepo?: string;
 }
 
 /** 自动添加用户默认值：新用户从 dsh-im 同步 / 自动创建时赋的默认角色。 */

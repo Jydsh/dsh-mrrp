@@ -75,6 +75,12 @@ export interface RpcDeps {
   imRoutingStatus?: () => Record<string, unknown>;
   /** 路由决策日志文件路径（logs.read 用；未提供则返回空） */
   logPath?: string;
+  /** 版本检查器（version.check 用；未提供则返回空信息） */
+  updater?: {
+    current(): string | null;
+    check(repo?: string): Promise<import('./updater.js').LatestVersionInfo | null>;
+    isAtLeast(current: string | null, latest: string | null): boolean;
+  };
 }
 
 const RPC_CHANNEL = 'mrrp';
@@ -487,6 +493,29 @@ export function installRpc(ctx: DshCtx, deps: RpcDeps): { install(): void; dispo
     return { logs: rows, path };
   }
 
+  /** 版本检查：对比当前插件版本与 GitHub 最新 Release，返回更新引导命令。
+   *  仓库路径优先取 config.updateRepo，缺省用插件默认仓库（Jydsh/dsh-mrrp）。 */
+  async function versionCheck(): Promise<unknown> {
+    const updater = deps.updater;
+    if (!updater) {
+      return { current: null, latest: null, source: null, updateAvailable: false, command: null, repo: null };
+    }
+    const repo = (store.get() as Record<string, unknown>)?.updateRepo;
+    const target = typeof repo === 'string' && repo.trim() ? repo.trim() : undefined;
+    const current = updater.current();
+    const latest = await updater.check(target);
+    const updateAvailable = Boolean(current && latest && !updater.isAtLeast(current, latest.version));
+    return {
+      current,
+      latest: latest?.version ?? null,
+      source: latest?.source ?? null,
+      updateAvailable,
+      command: updateAvailable
+        ? `dsh plugin --profile ${process.env.DSH_PROFILE ?? 'desktop'} add github:${target ?? 'Jydsh/dsh-mrrp'}#v${latest!.version}`
+        : null,
+    };
+  }
+
   async function dispatch(method: string, payload: Record<string, any> | undefined): Promise<unknown> {
     if (method === 'status') return status();
     if (method === 'providers.list') return providersList();
@@ -526,6 +555,7 @@ export function installRpc(ctx: DshCtx, deps: RpcDeps): { install(): void; dispo
     if (method === 'decision.fetch') return decisionFetch(payload);
     if (method === 'decision.test') return decisionTest(payload);
     if (method === 'logs.read') return logsRead(payload);
+    if (method === 'version.check') return versionCheck();
     throw Object.assign(new Error(`未知操作：${method}`), { code: 'unknown-method' });
   }
 

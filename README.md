@@ -49,6 +49,17 @@ dsh plugin --profile desktop add D:/dsh/dsh-mrrp
 
 安装完成后，在 DSH 侧边栏找到 **MRRP** 进入控制台：先到「模型分类」页创建分类并绑定模型 →「角色部门」页建角色并勾选分类模型 →「决策模型配置」页新增并启用 Laya 提供方 →「路由配置」页启动决策模型路由并选择兜底模型 → 对话模型选择器选中「MRRP 智能路由」即可按用户权限路由。
 
+### 版本检查与更新
+
+打开 MRRP 控制台时会**自动检查 GitHub 最新 Release**（读取 `api.github.com/repos/Jydsh/dsh-mrrp/releases/latest`，失败回退 `releases.atom`）；有新版本时顶部版本号变为 `v当前 ↑ v最新` 并出现更新横幅，点击版本号或横幅按钮**复制更新命令**，执行后重启 DSH 生效：
+
+```bash
+# 以桌面版为例（命令会按当前 profile 自动生成）
+dsh plugin --profile desktop add github:Jydsh/dsh-mrrp#v<最新版本>
+```
+
+顶部版本号也可随时点击手动检查更新。仓库路径默认指向本插件仓库 `Jydsh/dsh-mrrp`；不同插件仓库不同，可在 `config.json` 增加 `updateRepo` 字段（如 `"updateRepo": "Jydsh/dsh-mrrp"`）覆盖检查来源。
+
 ## 架构
 
 ```

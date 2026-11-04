@@ -7,6 +7,7 @@ import { makeImReader } from './dshim.js';
 import { createImRouting, pruneRouteLogFile } from './route-engine.js';
 import { readDingtalkBridgeSessions } from './dingtalk-bridge.js';
 import { createRouteAdapter } from './route-adapter.js';
+import { checkLatestVersion, getCurrentVersion, isAtLeast } from './updater.js';
 /**
  * dsh-mrrp: MRRP（Model Routing & Resource Planning）控制台插件。
  *
@@ -145,7 +146,12 @@ export async function apply(ctx: DshContext, config: ApplyConfig = {}): Promise<
     logger.warn?.('[dsh-mrrp] 当前 DSH 运行时无 ctx.llm.registerAdapter，无法暴露决策模型路由虚拟模型');
   }
 
-  const rpc = installRpc(ctx, { store, llm, logger, im, imRoutingStatus: () => imRouting.status(), logPath: routeLogPath });
+  const rpc = installRpc(ctx, {
+    store, llm, logger, im,
+    imRoutingStatus: () => imRouting.status(),
+    logPath: routeLogPath,
+    updater: { current: getCurrentVersion, check: checkLatestVersion, isAtLeast },
+  });
   try {
     rpc.install();
   } catch (error) {
