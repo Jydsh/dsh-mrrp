@@ -1,0 +1,921 @@
+import { makeLayaDecide, openaiChatDecide } from './decision.js';
+import { readFileSync, readdirSync, unlinkSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
+/** 按天路由决策日志文件名：route-decision-YYYY-MM-DD.log（多人共用、按天分文件，避免单文件臃肿）。 */
+export function routeLogFileName(now = new Date()) {
+    const y = now.getFullYear();
+    const m = String(now.getMonth() + 1).padStart(2, '0');
+    const d = String(now.getDate()).padStart(2, '0');
+    return `route-decision-${y}-${m}-${d}.log`;
+}
+/** 当天路由决策日志文件绝对路径（baseDir 为 config.json 所在目录）。 */
+export function routeLogPathFor(baseDir, now = new Date()) {
+    return join(baseDir, routeLogFileName(now));
+}
+const IM_SOURCE_KINDS = new Set(['plugin:dsh-im', 'runtime-context', 'time-context', 'skill-catalog', 'user']);
+function isRecord(value) {
+    return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+function pickString(value) {
+    return typeof value === 'string' && value.trim() ? value.trim() : null;
+}
+function log(deps, level, message, ...args) {
+    try {
+        deps.logger?.[level]?.(`[dsh-mrrp:im-route] ${message}`, ...args);
+    }
+    catch { /* ignore */ }
+}
+/** 安全摘要：JSON 序列化截断，避免大对象 / 循环引用 / 函数打爆日志。 */
+function safeSample(value, max = 300) {
+    if (typeof value === 'string')
+        return value.length > max ? `${value.slice(0, max)}…` : value;
+    try {
+        const s = JSON.stringify(value);
+        if (s === undefined)
+            return String(value);
+        return s.length > max ? `${s.slice(0, max)}…` : s;
+    }
+    catch {
+        return String(value);
+    }
+}
+/** source 字段形态摘要：懒函数调用一次取展开值，对象取 keys + 样本。 */
+function summarizeSource(src) {
+    if (typeof src === 'function') {
+        try {
+            const expanded = src();
+            return { type: 'function', expanded: safeSample(expanded) };
+        }
+        catch (error) {
+            return { type: 'function', error: error?.message ?? String(error) };
+        }
+    }
+    if (src && typeof src === 'object') {
+        return { type: 'object', keys: Object.keys(src), sample: safeSample(src) };
+    }
+    return { type: typeof src };
+}
+/** content 归一化为纯文本（支持 string 与 ContentBlock[]）。 */
+function contentToText(content) {
+    if (typeof content === 'string')
+        return content;
+    if (Array.isArray(content)) {
+        return content.map((part) => (isRecord(part) && typeof part.text === 'string' ? part.text : '')).join('');
+    }
+    return '';
+}
+/**
+ * dsh-im 把发送者信息作为 `<dsh_im_source>` 前缀块附加在用户消息正文之前：
+ *   <dsh_im_source>
+ *     ... senderId: 具体用户ID ...
+ *   </dsh_im_source>
+ *   （用户实际消息内容）
+ * 解析块内 senderId / senderName，返回 { senderId, senderName, rest }（rest=去掉前缀块后的正文）。
+ */
+function extractSenderFromContent(content) {
+    const m = /<dsh_im_source>([\s\S]*?)<\/dsh_im_source>/.exec(content);
+    if (!m)
+        return { senderId: '', senderName: '', rest: content };
+    const block = m[1];
+    const id = /senderId\s*[:：]\s*([^\s,，;；"'`}\]]+)/.exec(block)?.[1]?.trim() ?? '';
+    const name = /senderName\s*[:：]\s*([^\r\n]+)/.exec(block)?.[1]?.trim() ?? '';
+    const rest = content.slice(m.index + m[0].length).replace(/^\s*\r?\n?/, '');
+    return { senderId: id, senderName: name, rest };
+}
+/**
+ * 从会话事件对象提取消息来源与文本。
+ *
+ * 兼容两类宿主事件形状（实测根因修复）：
+ *  - dsh-im 的 `user/message`：event.data 是消息对象，senderId 位于消息顶层
+ *    （data.senderId），钉钉等渠道为 message.senderId / message.senderName；
+ *    data.source 可能是懒函数（source: () => ({ channel, senderId, chatId })）也可能
+ *    已被宿主展开为对象，两种都兼容。
+ *  - DSH agent inbox 的 `agent/inbox/spliced`：data.inserted 是 UserMessage[]（最新
+ *    插入在末尾），从最后一条消息提取发送者；`agent/inbox/inserted`：data.message。
+ *    若消息未携带 senderId（如 agent 自身注入的内容）则返回 null，不建立映射。
+ *
+ * 提取规则（senderId 存在作为 IM 来源强信号把关）：
+ *   1. 消息顶层 senderId；
+ *   2. source 展开（懒函数 / 对象）；
+ *   3. 消息正文 `<dsh_im_source>` 前缀块（dsh-im 把发送者信息附加在用户消息正文之前）。
+ * senderName 依次：source → 前缀块 → contextSource() → 消息顶层。
+ */
+export function extractEvent(context) {
+    const event = isRecord(context) ? context : {};
+    const type = event.type;
+    // 定位「消息对象」：不同事件类型的载体不同
+    let message = null;
+    if (type === 'user/message') {
+        message = isRecord(event.data) ? event.data : null;
+    }
+    else if (type === 'agent/inbox/spliced') {
+        const data = isRecord(event.data) ? event.data : {};
+        const inserted = Array.isArray(data.inserted) ? data.inserted : [];
+        // 最新插入在末尾；outcome='canceled' 是纯删除，无新消息
+        if (data.outcome === 'canceled' || inserted.length === 0)
+            return null;
+        const last = inserted[inserted.length - 1];
+        if (isRecord(last))
+            message = last;
+    }
+    else if (type === 'agent/inbox/inserted') {
+        const data = isRecord(event.data) ? event.data : {};
+        message = isRecord(data.message) ? data.message : (isRecord(data) ? data : null);
+    }
+    else {
+        return null;
+    }
+    if (!message)
+        return null;
+    // source 展开：懒函数或对象（dsh-im 消息带；inbox 标准消息可能没有）
+    let source = {};
+    const rawSource = message.source;
+    if (typeof rawSource === 'function') {
+        try {
+            const expanded = rawSource();
+            if (isRecord(expanded))
+                source = expanded;
+        }
+        catch { /* ignore */ }
+    }
+    else if (isRecord(rawSource)) {
+        source = rawSource;
+    }
+    // kind / form 排除：显式非 IM 来源（快照 / 目录 / 运行时上下文 / 其它插件）不路由
+    const kind = typeof source.kind === 'string' ? source.kind : '';
+    const form = typeof source.form === 'string' ? source.form : '';
+    if (kind && !IM_SOURCE_KINDS.has(kind))
+        return null;
+    if (kind && (form === 'snapshot' || form === 'notice' || form === 'catalog'))
+        return null;
+    // 正文归一化 + <dsh_im_source> 前缀块解析（dsh-im 把发送者信息附加在正文之前）
+    const contentText = contentToText(message.content);
+    const fromContent = extractSenderFromContent(contentText);
+    // senderId：消息顶层 → source 展开 → 正文前缀块
+    const senderId = pickString(message.senderId) ?? pickString(source.senderId) ?? fromContent.senderId;
+    if (!senderId)
+        return null;
+    // senderName：source → 前缀块 → contextSource() → 消息顶层
+    let senderName = pickString(source.senderName) ?? (fromContent.senderName || null) ?? pickString(message.senderName) ?? '';
+    if (!senderName && typeof message.contextSource === 'function') {
+        try {
+            const cs = message.contextSource();
+            if (isRecord(cs))
+                senderName = pickString(cs.senderName) ?? '';
+        }
+        catch { /* ignore */ }
+    }
+    const text = fromContent.rest || contentText;
+    const channel = pickString(source.channel) ?? pickString(message.channel) ?? '';
+    return { channel, senderId, senderName, text: text.trim() };
+}
+/** 聚合用户可用模型：单独角色 + 所属部门绑定的角色，按分类取并集。 */
+export function collectUserModels(config, user) {
+    const roleById = new Map(config.roles.map((role) => [role.id, role]));
+    const deptById = new Map(config.depts.map((dept) => [dept.id, dept]));
+    const merge = (map, bindings) => {
+        for (const binding of bindings) {
+            if (!binding.categoryId)
+                continue;
+            let set = map.get(binding.categoryId);
+            if (!set) {
+                set = new Set();
+                map.set(binding.categoryId, set);
+            }
+            for (const model of binding.modelIds)
+                if (model)
+                    set.add(model);
+        }
+    };
+    const out = new Map();
+    if (user.roleId) {
+        const role = roleById.get(user.roleId);
+        if (role)
+            merge(out, role.categoryBindings);
+    }
+    for (const deptId of user.deptIds) {
+        const dept = deptById.get(deptId);
+        if (!dept)
+            continue;
+        for (const roleId of dept.roleIds) {
+            const role = roleById.get(roleId);
+            if (role)
+                merge(out, role.categoryBindings);
+        }
+    }
+    return out;
+}
+/** 方案 B：用户可用模型按来源拆分——直接角色（显式授权，最高）优先，部门继承（组织授权）并集补充。 */
+export function collectUserModelsPrioritized(config, user) {
+    const roleById = new Map(config.roles.map((role) => [role.id, role]));
+    const deptById = new Map(config.depts.map((dept) => [dept.id, dept]));
+    const addModels = (set, bindings) => {
+        for (const binding of bindings) {
+            for (const model of binding.modelIds)
+                if (model)
+                    set.add(model);
+        }
+    };
+    const direct = new Set();
+    if (user.roleId) {
+        const role = roleById.get(user.roleId);
+        if (role)
+            addModels(direct, role.categoryBindings);
+    }
+    const inherited = new Set();
+    for (const deptId of user.deptIds) {
+        const dept = deptById.get(deptId);
+        if (!dept)
+            continue;
+        for (const roleId of dept.roleIds) {
+            const role = roleById.get(roleId);
+            if (role)
+                addModels(inherited, role.categoryBindings);
+        }
+    }
+    // 多部门全部并集；部门继承不重复直接角色已有的模型
+    const dedup = (set, skip) => {
+        const out = [];
+        for (const model of set)
+            if (model && !skip.has(model))
+                out.push(model);
+        return out;
+    };
+    return { direct: dedup(direct, new Set()), inherited: dedup(inherited, direct) };
+}
+/** 把用户可用模型（分类 → 模型集合）展平为去重后的候选模型列表。 */
+export function flattenUserModels(bindings) {
+    const seen = new Set();
+    const out = [];
+    for (const set of bindings.values()) {
+        for (const model of set) {
+            if (model && !seen.has(model)) {
+                seen.add(model);
+                out.push(model);
+            }
+        }
+    }
+    return out;
+}
+/** 从 laya 决策响应中提取「问题名 -> 判定值」映射（兼容多种返回形状）。 */
+export function extractDecisionValues(data) {
+    const out = {};
+    const visit = (value, path) => {
+        if (!value || typeof value !== 'object')
+            return;
+        const rec = value;
+        const response = rec.response && typeof rec.response === 'object' ? rec.response : null;
+        const question = typeof rec.question === 'string'
+            ? rec.question
+            : typeof rec.name === 'string' ? rec.name : '';
+        if (response) {
+            const picked = response.choice !== undefined ? response.choice
+                : response.score !== undefined ? response.score
+                    : response.noul !== undefined ? response.noul : undefined;
+            if (question && picked !== undefined) {
+                out[question] = String(picked);
+                return;
+            }
+            // 无顶层 question（如内嵌模型决策 { model: { response: { choice } } }）：
+            // 把 response 内部的判定值提到顶层，供 pickedModelFrom / resolveTargetModel 读取。
+            for (const [k, v] of Object.entries(response)) {
+                if (['type', 'instructions', 'criteria', 'reasoning', 'metadata', 'meta'].includes(k))
+                    continue;
+                if (v !== undefined && v !== null)
+                    out[k] = String(v);
+            }
+        }
+        if (Array.isArray(value)) {
+            for (const item of value)
+                visit(item, path);
+            return;
+        }
+        for (const [key, child] of Object.entries(rec)) {
+            if (['response', 'type', 'instructions', 'criteria', 'reasoning', 'metadata', 'meta'].includes(key))
+                continue;
+            if (question && key === 'choice' || question && key === 'score' || question && key === 'noul')
+                continue;
+            if (typeof child === 'string' || typeof child === 'number' || typeof child === 'boolean') {
+                out[key] = String(child);
+            }
+            else if (child && typeof child === 'object') {
+                visit(child, path ? `${path}.${key}` : key);
+            }
+        }
+    };
+    visit(data, '');
+    return out;
+}
+/** 从 laya 决策响应中提取选择理由（reasoning）文本（兼容多种返回形状），供日志记录。 */
+export function extractReasoning(data) {
+    if (!data || typeof data !== 'object')
+        return undefined;
+    const visit = (value) => {
+        if (!value || typeof value !== 'object')
+            return undefined;
+        const rec = value;
+        const response = rec.response && typeof rec.response === 'object' ? rec.response : null;
+        const candidates = response ? [response] : [];
+        if (Array.isArray(rec.answers))
+            candidates.push(...rec.answers);
+        for (const item of candidates) {
+            if (item && typeof item === 'object' && typeof item.reasoning === 'string'
+                && item.reasoning.trim()) {
+                return item.reasoning.trim().slice(0, 500);
+            }
+        }
+        if (typeof rec.reasoning === 'string' && rec.reasoning.trim())
+            return rec.reasoning.trim().slice(0, 500);
+        for (const child of Object.values(rec)) {
+            if (child && typeof child === 'object') {
+                const found = visit(child);
+                if (found)
+                    return found;
+            }
+        }
+        return undefined;
+    };
+    return visit(data);
+}
+/** 解析模型标识 provider:id；无效返回 null。 */
+export function parseModelKey(key) {
+    const text = (key ?? '').trim();
+    const index = text.indexOf(':');
+    if (index <= 0 || index === text.length - 1)
+        return null;
+    const provider = text.slice(0, index).trim();
+    const model = text.slice(index + 1).trim();
+    if (!provider || !model || provider.length > 128 || model.length > 128)
+        return null;
+    return { provider, model };
+}
+/** 生成路径的候选选择超时：决策慢 / 不可达时快速落兜底，避免用户干等。 */
+const DECISION_TIMEOUT_MS = 6000;
+/** OpenAI 兼容对话判定超时（普通大模型推理比 laya 判定慢，放宽到 10s）。 */
+const CHAT_DECISION_TIMEOUT_MS = 10_000;
+/** 生效的决策提供方有序列表：优先 imRoute.decisionProviderIds，空则回退 [decisionProviderId]。 */
+export function effectiveDecisionProviderIds(cfg) {
+    if (!cfg)
+        return [];
+    const list = Array.isArray(cfg.decisionProviderIds) && cfg.decisionProviderIds.length
+        ? cfg.decisionProviderIds
+        : (cfg.decisionProviderId ? [cfg.decisionProviderId] : []);
+    return list.filter((id) => typeof id === 'string' && id.trim()).map((id) => id.trim());
+}
+/**
+ * 创建决策执行器：多提供方「负载均衡（轮询起始）+ 故障转移（失败按序换下一个）」。
+ * - decide 注入（测试）：直接单次调用，providerId 取列表首个；
+ * - execute 注入（测试）：替换真实 makeLayaDecide 网络调用，便于断言轮询 / 转移；
+ * - 缺省：从 config.decisionProviders 匹配启用的 laya 提供方（format=laya 且 baseUrl 非空）。
+ */
+export function createDecisionRunner(ctx) {
+    const providersOf = (config, ids) => {
+        const out = [];
+        for (const id of ids) {
+            const provider = config.decisionProviders.find((item) => item.id === id);
+            // 决策提供方支持 laya 与 OpenAI 兼容格式（openai / generic）：
+            // 云端判定型服务（如阿里云 MaaS compatible-mode/systemone、0G decisions）走同一判定协议，
+            // 请求体按格式带判定模型名（modelNames[0]）。
+            if (provider && provider.baseUrl && (provider.format === 'laya' || provider.format === 'openai' || provider.format === 'generic'))
+                out.push(provider);
+        }
+        return out;
+    };
+    let rr = 0;
+    return {
+        async run({ providerIds, state, questions, onDecide }) {
+            const ids = providerIds.filter(Boolean);
+            if (!ids.length)
+                return null;
+            // 测试注入：直接走 decide（单次）
+            if (typeof ctx.decide === 'function') {
+                try {
+                    onDecide?.('before', { providerId: ids[0], state, questions, timeoutMs: DECISION_TIMEOUT_MS });
+                    const data = await ctx.decide(state, questions);
+                    onDecide?.('after', { providerId: ids[0], raw: data });
+                    return { data, providerId: ids[0], failover: false };
+                }
+                catch (error) {
+                    onDecide?.('error', { providerId: ids[0], message: error?.message ?? String(error) });
+                    return null;
+                }
+            }
+            // 真实路径：过滤启用的决策提供方（laya / openai / generic，baseUrl 非空）
+            const providers = providersOf(ctx.getConfig(), ids);
+            if (!providers.length) {
+                onDecide?.('error', { providerId: ids[0], message: '未找到启用的决策提供方（format=laya/openai/generic 且 baseUrl 非空）' });
+                return null;
+            }
+            // 负载均衡：轮询挑起始提供方；故障转移：失败按序换下一个
+            const start = (rr % providers.length);
+            rr += 1;
+            for (let i = 0; i < providers.length; i += 1) {
+                const provider = providers[(start + i) % providers.length];
+                const failover = i > 0;
+                try {
+                    onDecide?.('before', {
+                        providerId: provider.id,
+                        provider: { baseUrl: provider.baseUrl, endpoint: provider.endpoint, format: provider.format },
+                        state,
+                        questions,
+                        timeoutMs: DECISION_TIMEOUT_MS,
+                        failover,
+                    });
+                    let data;
+                    if (ctx.execute) {
+                        data = await ctx.execute(provider, state, questions, DECISION_TIMEOUT_MS);
+                    }
+                    else if (provider.endpoint === 'chat') {
+                        // OpenAI 兼容对话判定：普通大模型当判定器（format=openai/generic，无判定协议端点）
+                        const run = openaiChatDecide(() => ({
+                            baseUrl: provider.baseUrl,
+                            apiKey: provider.apiKey || '',
+                            model: (provider.modelNames?.[0] || '').trim(),
+                        }), CHAT_DECISION_TIMEOUT_MS);
+                        data = await run({ state, questions });
+                    }
+                    else {
+                        // 判定协议（systemone / decisions）：云端判定型服务请求体带判定模型名（modelNames[0]），
+                        // 如阿里云 MaaS 的 decision-model-preview；本地 laya 不带 model 字段。
+                        const decisionModel = provider.format === 'laya' ? '' : (provider.modelNames?.[0] || '').trim();
+                        const run = makeLayaDecide(() => ({
+                            baseUrl: provider.baseUrl,
+                            apiKey: provider.apiKey || '',
+                            endpoint: provider.endpoint,
+                            model: decisionModel || undefined,
+                        }), DECISION_TIMEOUT_MS);
+                        data = await run({ state, questions });
+                    }
+                    onDecide?.('after', { providerId: provider.id, raw: data, failover });
+                    return { data, providerId: provider.id, failover };
+                }
+                catch (error) {
+                    onDecide?.('error', { providerId: provider.id, message: error?.message ?? String(error), failover });
+                }
+            }
+            return null;
+        },
+    };
+}
+/** 内置判定问题：让 laya 在候选模型里选一个（插件内置，用户不再配置）。
+ *  候选带类型/擅长场景（来自分类画像）后，criteria 值 = 「名称（类型：…；擅长：…）」，
+ *  Laya 可依据类型语义做决策，不再只靠模型名猜测。 */
+export function builtinModelChoiceQuestion(candidates, context) {
+    const criteria = {};
+    for (const candidate of candidates) {
+        const parts = [candidate.name];
+        if (candidate.type)
+            parts.push(`类型：${candidate.type}`);
+        if (candidate.scene)
+            parts.push(`擅长：${candidate.scene}`);
+        criteria[candidate.key] = parts.join('；');
+    }
+    const contextBlock = context ? `\n背景：${context}` : '';
+    return {
+        type: 'choice',
+        instructions: `state 中是用户的问题正文。请根据问题的语义、复杂度、是否涉及代码/视觉/长文本、所需推理深度，从候选模型列表中选择最合适的模型；候选已标注类型与擅长场景。只能选择候选模型列表中存在的 key，不要编造其它 key，并在 response 中附带一句简短 reasoning 说明选择理由。${contextBlock}`,
+        criteria,
+    };
+}
+/** 收集用户可用模型池（决策上下文缓存用）：用户命中 + 直接角色 / 部门继承候选。 */
+export function collectUserModelPool(config, senderId) {
+    const user = config.users.find((item) => item.id === senderId);
+    if (!user)
+        return { userFound: false, direct: [], inherited: [] };
+    const { direct, inherited } = collectUserModelsPrioritized(config, user);
+    return { userFound: true, user, direct, inherited };
+}
+/**
+ * 目标模型决策（纯逻辑，无副作用；导出供测试）。
+ *
+ * 顺序：未注册用户（unknownUser）→ 用户可用模型池（角色 + 部门，去重）→
+ *   池空用兜底；池唯一直接用；池多个用内置判定问题请决策模型（laya）选择 →
+ *   决策失败 / 未命中用兜底。
+ *
+ * 候选池可经 collectUserModelPool 缓存（决策输入复用），每次消息仍执行本决策：
+ * 候选多时每次都让 Laya 按消息内容选择模型，不再按会话锁死已决策模型。
+ */
+export async function resolveTargetModel(deps, cfg, senderId, text) {
+    const config = deps.getConfig();
+    return resolveTargetModelFromPool(collectUserModelPool(config, senderId), deps, cfg, senderId, text);
+}
+/** 附件类型合法值（决策提示用，防止任意字符串污染判定问题）。 */
+const ATTACHMENT_TYPES = new Set(['image', 'video', 'file', 'audio']);
+/** 附件类型 → 中文标签（用于决策提示）。 */
+const ATTACHMENT_LABELS = {
+    image: '图片',
+    video: '视频',
+    file: '文件',
+    audio: '音频',
+};
+/**
+ * 构造附件能力提示：仅当消息带附件时追加。
+ * 决策模型不需要理解附件内容——只按「附件类型 → 需要对应输入能力的模型」决策。
+ */
+export function attachmentContextHint(attachments) {
+    const types = (attachments || [])
+        .map((t) => String(t).trim().toLowerCase())
+        .filter((t) => ATTACHMENT_TYPES.has(t));
+    if (!types.length)
+        return '';
+    const labels = [...new Set(types)].map((t) => ATTACHMENT_LABELS[t] || t).join('、');
+    return ` 本条消息包含附件：${labels}。决策目标：优先选择候选模型中「能处理该类输入」的模型（候选类型/擅长场景中标注了 多模态/图片/视频/文件/音频 等能力标签的优先；若候选均无对应能力，再按任务语义选择最合适的模型）。`;
+}
+/**
+ * 模型画像类型文本：控制台手动维护的 modelProfiles.type（多选数组）优先，
+ * 未配置则取模型所在分类的「名称」兜底；返回 undefined 表示无任何类型标注。
+ */
+export function profileTypeText(config, key) {
+    const profile = config.modelProfiles?.[key];
+    const hits = config.categories.filter((category) => category.modelIds.includes(key));
+    const profileTypes = Array.isArray(profile?.type)
+        ? profile.type.filter(Boolean)
+        : (typeof profile?.type === 'string' && profile.type.trim() ? [profile.type.trim()] : []);
+    return profileTypes.length ? profileTypes.join('、') : hits.map((category) => category.name).join('、') || undefined;
+}
+/** 附件能力关键词：画像/分类类型文本命中任一即视为「可处理该附件输入」。 */
+const ATTACHMENT_CAPABILITY_HINTS = ['多模态', '图片', '视觉', '图像', '视频', '文件', '文档', '音频', '语音', 'vision', 'image', 'multimodal', 'video', 'file', 'audio'];
+export function hasAttachmentCapability(typeText) {
+    if (!typeText)
+        return false;
+    const t = typeText.toLowerCase();
+    return ATTACHMENT_CAPABILITY_HINTS.some((h) => t.includes(h.toLowerCase()));
+}
+/**
+ * 附件能力硬校验：决策模型（如本地 laya）可能无视附件提示、不读能力标签，
+ * 把带附件消息判给无对应能力的模型（实测：对候选第一位有强位置偏见）。
+ * 规则：被选模型画像/分类已含能力标签 → 不干预；否则改选候选池中第一个
+ * 含能力标签的模型（直接授权在前）；池内确无能力模型 → 返回 null 保持原决策。
+ */
+export function enforceAttachmentCapability(picked, candidates, config, attachments) {
+    if (!attachmentContextHint(attachments))
+        return null;
+    if (hasAttachmentCapability(profileTypeText(config, picked)))
+        return null;
+    return candidates.find((key) => key !== picked && hasAttachmentCapability(profileTypeText(config, key))) ?? null;
+}
+/**
+ * 目标模型决策主流程（候选池已就绪）：
+ *   池空用兜底；池唯一直接用；池多个用内置判定问题请决策模型（laya）选择 →
+ *   决策失败 / 未命中用兜底。
+ *
+ * attachments：本条消息携带的附件类型（image / video / file / audio 等，可空）。
+ * 决策模型无需理解附件内容——判定问题会带上「本条消息包含 XX 附件」提示，
+ * 让 Laya 优先选择候选画像中标注了对应能力（多模态 / 图片 / 视频 / 文件）的模型。
+ */
+export async function resolveTargetModelFromPool(pool, deps, cfg, senderId, text, attachments) {
+    const config = deps.getConfig();
+    // 1. 未注册用户
+    if (!pool.userFound) {
+        if (cfg.unknownUser !== 'fallback' || !cfg.fallbackModel)
+            return null;
+        return { model: cfg.fallbackModel, source: 'unknown-fallback', candidates: [], sources: { direct: [], inherited: [] } };
+    }
+    // 2. 用户可用模型池（方案 B：直接角色在前 = 显式授权最高；部门继承并集补充）
+    const candidates = [...pool.direct, ...pool.inherited];
+    const sources = { direct: pool.direct, inherited: pool.inherited };
+    if (candidates.length === 0) {
+        if (cfg.fallbackModel)
+            return { model: cfg.fallbackModel, source: 'fallback', candidates, sources };
+        return null;
+    }
+    if (candidates.length === 1) {
+        return { model: candidates[0], source: 'user', candidates, sources };
+    }
+    // 3. 多个候选：内置判定问题请决策模型选择（多提供方：负载均衡轮询 + 故障转移）
+    const providerIds = effectiveDecisionProviderIds(cfg);
+    if (!providerIds.length) {
+        if (cfg.fallbackModel)
+            return { model: cfg.fallbackModel, source: 'fallback', candidates, sources };
+        return null;
+    }
+    const question = builtinModelChoiceQuestion(candidates.map((key) => {
+        const parsed = parseModelKey(key);
+        const type = profileTypeText(config, key);
+        // 擅长场景：手动画像优先；未配置时回退到模型绑定分类的描述（同一分类的模型共用同一段擅长文案）。
+        const scene = config.modelProfiles?.[key]?.scene || config.categories.filter((category) => category.modelIds.includes(key)).map((category) => category.desc).filter(Boolean).join('；') || undefined;
+        return { key, name: parsed ? parsed.model : key, type, scene };
+    }), `发送者：${pool.user?.name || senderId}；候选授权来源：用户直接角色 ${pool.direct.length} 个模型 / 部门继承 ${pool.inherited.length} 个模型。${attachmentContextHint(attachments)}`);
+    const questions = { model: question };
+    const state = text || senderId;
+    const runner = deps.decisionRunner ?? createDecisionRunner({ getConfig: deps.getConfig, decide: deps.decide });
+    const result = await runner.run({
+        providerIds,
+        state,
+        questions,
+        onDecide: deps.onDecide ? ((phase, detail) => deps.onDecide?.(phase, detail)) : undefined,
+    });
+    if (result) {
+        const decision = extractDecisionValues(result.data);
+        // 内置判定问题是 choice 类型，答案在 choice 字段；model 字段可能是 Laya 响应的
+        // 服务/路由元数据（如 laya-rl-agent / multilingual），不能直接当作判定值。
+        // 按「在候选池中匹配」优先取 choice，避免被元数据污染导致决策成功却误判失败。
+        const picked = [decision.choice, decision.model].find((v) => v && candidates.includes(v)) ?? '';
+        if (picked) {
+            // 附件能力硬校验：本地 laya 实测无视附件提示、对候选第一位有强位置偏见，
+            // 带图消息可能被判给无视觉能力的模型——此处强制校正（日志 attachment-override）。
+            const overridden = enforceAttachmentCapability(picked, candidates, config, attachments);
+            if (overridden) {
+                log(deps, 'warn', `附件能力校验：决策选中 ${picked} 无对应附件能力，强制改选 ${overridden}（attachment-override）。`);
+                return { model: overridden, source: 'laya', candidates, sources, decision, reasoning: extractReasoning(result.data), providerId: result.providerId, failover: result.failover, attachmentOverride: true };
+            }
+            return { model: picked, source: 'laya', candidates, sources, decision, reasoning: extractReasoning(result.data), providerId: result.providerId, failover: result.failover };
+        }
+        log(deps, 'warn', `决策结果未命中候选模型（${picked || '(空)'}），回退兜底模型。`);
+    }
+    // 4. 决策失败 / 未命中：兜底
+    if (cfg.fallbackModel)
+        return { model: cfg.fallbackModel, source: 'fallback', candidates, sources };
+    return null;
+}
+/** 从会话事件回调参数提取会话 id（session.id 或 session.header.id）。 */
+export function sessionIdOf(session) {
+    if (!isRecord(session))
+        return '';
+    return pickString(session.id) ?? pickString(session.header?.id) ?? '';
+}
+/**
+ * 创建会话发送者映射 + 路由诊断引擎。
+ *
+ * 新方案下不再切换会话模型（selectModel）；事件观测只做一件事：
+ * 记录「会话 id → 最近发送者」映射，供 adapter 在生成调用时解析用户。
+ */
+export function createImRouting(ctx, deps) {
+    const logger = deps.logger;
+    let attached = null;
+    let off = null;
+    let last = { at: 0, senderId: '', senderName: '', error: '' };
+    let mappedCount = 0;
+    let rejectLogged = false;
+    const senderBySession = new Map();
+    // dsh-dingtalk 桥映射（sessionId -> senderId / senderName）：事件观测之外的兜底来源
+    const bridgeSessions = new Map();
+    const bridgeNames = new Map();
+    const BRIDGE_TTL_MS = 5_000;
+    let bridgeLoadedAt = 0;
+    let bridgeLoading = null;
+    /** 从 config.users 解析发送者姓名（桥映射只给 senderId）。 */
+    const bridgeNameOf = (senderId) => {
+        const hit = bridgeNames.get(senderId);
+        if (hit !== undefined)
+            return hit;
+        let name = '';
+        try {
+            const users = deps.getConfig().users ?? [];
+            const found = (Array.isArray(users) ? users : []).find((u) => u?.id === senderId);
+            name = typeof found?.name === 'string' ? found.name : '';
+        }
+        catch { /* ignore */ }
+        bridgeNames.set(senderId, name);
+        return name;
+    };
+    /** 刷新 dingtalk 桥会话映射（TTL 防抖 + 防重入）。 */
+    const refreshBridge = async () => {
+        if (!deps.dingtalkBridge)
+            return;
+        const now = Date.now();
+        if (now - bridgeLoadedAt < BRIDGE_TTL_MS && bridgeSessions.size > 0)
+            return;
+        if (bridgeLoading)
+            return bridgeLoading;
+        bridgeLoading = (async () => {
+            try {
+                const sessions = await deps.dingtalkBridge.readSessions();
+                const before = bridgeSessions.size;
+                for (const [sessionId, senderId] of sessions)
+                    bridgeSessions.set(sessionId, senderId);
+                bridgeLoadedAt = Date.now();
+                const added = bridgeSessions.size - before;
+                if (added > 0 || before === 0) {
+                    log(deps, 'info', `会话映射（dingtalk 桥）：${bridgeSessions.size} 个会话（本次新增 ${added}）`);
+                }
+            }
+            catch (error) {
+                log(deps, 'warn', `读取 dingtalk 桥会话映射失败：${error?.message ?? error}`);
+            }
+            finally {
+                bridgeLoading = null;
+            }
+        })();
+        return bridgeLoading;
+    };
+    /** 事件观测被拒（形状不匹配）时记一次诊断样本，避免每消息刷屏。 */
+    const logFirstReject = (detail) => {
+        if (rejectLogged)
+            return;
+        rejectLogged = true;
+        log(deps, 'warn', `会话事件观测拒绝（仅记录首个样本）：`, detail);
+    };
+    const handler = async (session, event) => {
+        try {
+            const cfg = deps.getConfig().route?.imRoute;
+            if (!isRecord(event)) {
+                logFirstReject({ reason: '回调 event 非对象', type: typeof event });
+                return;
+            }
+            const info = extractEvent(event);
+            if (!info) {
+                // 事件未带发送者身份（DSH inbox 常见）：尝试从 dingtalk 桥反查，同时记录诊断样本
+                void refreshBridge();
+                const data = isRecord(event.data) ? event.data : {};
+                const inserted = Array.isArray(data.inserted) ? data.inserted : [];
+                const firstMsg = inserted.length > 0 && isRecord(inserted[0]) ? inserted[0] : null;
+                logFirstReject({
+                    reason: 'extractEvent 未提取到 IM 消息（无 senderId 或非 IM 来源）',
+                    type: event.type,
+                    eventKeys: Object.keys(event),
+                    dataKeys: Object.keys(data),
+                    hasSenderId: typeof event.data === 'object' && event.data !== null ? 'senderId' in event.data : false,
+                    insertedCount: inserted.length,
+                    firstInsertedKeys: firstMsg ? Object.keys(firstMsg) : null,
+                    firstInsertedHasSenderId: firstMsg ? ('senderId' in firstMsg) : null,
+                    firstInsertedSource: firstMsg ? summarizeSource(firstMsg.source) : null,
+                    firstInsertedContent: firstMsg ? safeSample(contentToText(firstMsg.content), 500) : null,
+                });
+                return;
+            }
+            // 渠道白名单：channel 缺失时不拦截（无法判断渠道则放行，宁多勿漏）
+            if (cfg?.channels && cfg.channels.length > 0 && info.channel && !cfg.channels.includes(info.channel)) {
+                logFirstReject({ reason: '渠道不在白名单', channel: info.channel, channels: cfg.channels });
+                return;
+            }
+            const sessionId = sessionIdOf(session);
+            if (!sessionId) {
+                last = { at: Date.now(), senderId: info.senderId, senderName: info.senderName, error: '事件未携带会话 id，无法建立映射' };
+                log(deps, 'warn', `事件未携带会话 id，无法建立映射（sender=${info.senderName || info.senderId}）`);
+                return;
+            }
+            senderBySession.set(sessionId, { senderId: info.senderId, senderName: info.senderName, at: Date.now() });
+            mappedCount += 1;
+            last = { at: Date.now(), senderId: info.senderId, senderName: info.senderName, error: '' };
+            log(deps, 'info', `会话映射：${sessionId} -> ${info.senderName || info.senderId}${cfg?.enabled ? '（决策模型已启动）' : '（决策模型未启动）'}`);
+        }
+        catch (error) {
+            last = { at: Date.now(), senderId: '', senderName: '', error: error?.message ?? String(error) };
+            log(deps, 'warn', `事件观测异常（已忽略，不影响主链路）：${error?.message ?? error}`);
+        }
+    };
+    return {
+        start() {
+            if (attached)
+                return;
+            // 先加载 dingtalk 桥映射（插件启动可能早于钉钉桥写入，稍后再补一次）
+            void refreshBridge();
+            if (typeof ctx?.on !== 'function') {
+                log(deps, 'warn', '当前 DSH 运行时未提供 ctx.on，会话发送者映射不可用（决策模型路由将无法解析用户）');
+                return;
+            }
+            attached = (session, event) => { void handler(session, event); };
+            try {
+                const result = ctx.on('session/event', attached);
+                if (typeof result === 'function')
+                    off = result;
+                log(deps, 'info', '会话事件观测已订阅（决策模型路由依赖此映射解析用户）');
+                // 钉钉桥可能晚于插件启动，延迟再刷一次兜底
+                setTimeout(() => { void refreshBridge(); }, 2_000);
+            }
+            catch (error) {
+                log(deps, 'warn', `订阅会话事件失败：${error?.message ?? error}`);
+                attached = null;
+            }
+        },
+        stop() {
+            if (!attached)
+                return;
+            if (typeof off === 'function') {
+                try {
+                    off();
+                }
+                catch { /* ignore */ }
+            }
+            else if (typeof ctx?.off === 'function') {
+                try {
+                    ctx.off('session/event', attached);
+                }
+                catch { /* ignore */ }
+            }
+            attached = null;
+            off = null;
+        },
+        status() {
+            const cfg = deps.getConfig().route?.imRoute;
+            return {
+                subscribed: attached !== null,
+                enabled: Boolean(cfg?.enabled),
+                decisionProviderId: cfg?.decisionProviderId ?? '',
+                decisionProviderIds: effectiveDecisionProviderIds(cfg),
+                mappedCount,
+                mappedSessions: senderBySession.size,
+                bridgeSessions: bridgeSessions.size,
+                last: { ...last, at: last.at ? new Date(last.at).toISOString() : null },
+            };
+        },
+        resolveSender(sessionId) {
+            if (!sessionId)
+                return null;
+            const hit = senderBySession.get(sessionId);
+            if (hit)
+                return { senderId: hit.senderId, senderName: hit.senderName };
+            // 事件观测 miss：查 dingtalk 桥映射（sessionId -> senderId），并触发后台刷新
+            const bridgeId = bridgeSessions.get(sessionId);
+            if (bridgeId) {
+                const name = bridgeNameOf(bridgeId);
+                return { senderId: bridgeId, senderName: name || bridgeId };
+            }
+            // 会话 id 可能被宿主派生（如带前缀 / 简写），做最宽松的包含匹配兜底
+            for (const [key, value] of senderBySession) {
+                if (key.includes(sessionId) || sessionId.includes(key)) {
+                    return { senderId: value.senderId, senderName: value.senderName };
+                }
+            }
+            for (const [key, bridgeId] of bridgeSessions) {
+                if (key.includes(sessionId) || sessionId.includes(key)) {
+                    const name = bridgeNameOf(bridgeId);
+                    return { senderId: bridgeId, senderName: name || bridgeId };
+                }
+            }
+            void refreshBridge();
+            return null;
+        },
+    };
+}
+/**
+ * 清理路由决策日志（route-decision.log）：删除超过 maxAgeDays 天的 JSON 行（按每行 ts 判断）。
+ * 坏行 / 无 ts 的行保留不误删；文件不存在或读写失败静默返回 0（清理失败绝不影响路由主链路）。
+ * 返回删除的行数。
+ */
+export function pruneRouteLogFile(logPath, maxAgeDays, now = Date.now()) {
+    if (!logPath || !(maxAgeDays > 0))
+        return 0;
+    let text = '';
+    try {
+        text = readFileSync(logPath, 'utf8');
+    }
+    catch {
+        return 0;
+    }
+    const cutoff = now - maxAgeDays * 24 * 60 * 60 * 1000;
+    const lines = text.split('\n');
+    const kept = [];
+    let removed = 0;
+    for (const line of lines) {
+        if (!line.trim()) {
+            kept.push(line);
+            continue;
+        }
+        let ts = 0;
+        try {
+            const parsed = JSON.parse(line);
+            if (parsed && typeof parsed === 'object' && typeof parsed.ts === 'string') {
+                ts = new Date(parsed.ts).getTime();
+            }
+        }
+        catch {
+            /* 坏行保留，不误删 */
+        }
+        if (ts && ts < cutoff) {
+            removed += 1;
+            continue;
+        }
+        kept.push(line);
+    }
+    if (removed === 0)
+        return 0;
+    try {
+        writeFileSync(logPath, kept.join('\n'), 'utf8');
+    }
+    catch {
+        return 0;
+    }
+    return removed;
+}
+/** 清理按天路由决策日志：删除 baseDir 下「文件名日期早于 maxAgeDays 天」的 route-decision-YYYY-MM-DD.log。
+ *  文件不存在 / 读取失败 / 无匹配文件均静默返回 0；返回删除的文件数。 */
+export function pruneRouteLogDir(baseDir, maxAgeDays, now = Date.now()) {
+    if (!baseDir || !(maxAgeDays > 0))
+        return 0;
+    const cutoff = now - maxAgeDays * 24 * 60 * 60 * 1000;
+    const nameRe = /^route-decision-(\d{4})-(\d{2})-(\d{2})\.log$/;
+    let names = [];
+    try {
+        names = readdirSync(baseDir);
+    }
+    catch {
+        return 0;
+    }
+    let removed = 0;
+    for (const name of names) {
+        const m = nameRe.exec(name);
+        if (!m)
+            continue;
+        const fileDate = new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3])).getTime();
+        if (!Number.isFinite(fileDate) || fileDate >= cutoff)
+            continue;
+        try {
+            unlinkSync(join(baseDir, name));
+            removed += 1;
+        }
+        catch { /* 删除失败静默跳过，不影响其它文件 */ }
+    }
+    return removed;
+}

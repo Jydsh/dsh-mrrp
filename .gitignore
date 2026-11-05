@@ -1,6 +1,9 @@
 node_modules/
-dist/
 *.tgz
 .tmp/
 Temp/
 _shots/
+
+# dist 是构建产物，但必须入库：
+# main 指向 ./dist/index.js，从 GitHub 仓库直接安装（dsh plugin add <git-url>）时
+# 不会执行构建，缺 dist 会报 ERR_MODULE_NOT_FOUND。改源码后请 npx tsc 并提交 dist。
