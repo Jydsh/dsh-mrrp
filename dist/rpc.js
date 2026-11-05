@@ -669,27 +669,46 @@ export function installRpc(ctx, deps) {
         }
         return { name, removed };
     }
-    /** 版本检查：对比当前插件版本与 GitHub 最新 Release，返回更新引导命令。
+    /** 版本检查：对比当前插件版本与 GitHub 最新 Release，并返回本机安装环境识别结果。
      *  仓库路径优先取 config.updateRepo，缺省用插件默认仓库（Jydsh/dsh-mrrp）。 */
     async function versionCheck() {
         const updater = deps.updater;
         if (!updater) {
-            return { current: null, latest: null, source: null, updateAvailable: false, command: null, repo: null };
+            return {
+                current: null, latest: null, source: null, updateAvailable: false,
+                command: null, repo: null, env: null,
+            };
         }
         const repo = store.get().updateRepo;
         const target = typeof repo === 'string' && repo.trim() ? repo.trim() : undefined;
         const current = updater.current();
         const latest = await updater.check(target);
         const updateAvailable = Boolean(current && latest && !updater.isAtLeast(current, latest.version));
+        // 命令按本机真实环境算出，与「一键更新」实际执行的完全一致
+        const env = latest ? updater.detect(target, latest.version) : null;
         return {
             current,
             latest: latest?.version ?? null,
             source: latest?.source ?? null,
             updateAvailable,
-            command: updateAvailable
-                ? `dsh plugin --profile ${process.env.DSH_PROFILE ?? 'desktop'} add github:${target ?? 'Jydsh/dsh-mrrp'}#v${latest.version}`
-                : null,
+            command: updateAvailable ? env?.command || null : null,
+            env,
+            repo: target ?? null,
         };
+    }
+    /** 一键更新：按识别出的本机环境执行对应安装命令（dsh plugin / pnpm / npm）。 */
+    async function versionUpdate() {
+        const updater = deps.updater;
+        if (!updater)
+            throw Object.assign(new Error('当前环境不支持一键更新。'), { code: 'unsupported' });
+        const repo = store.get().updateRepo;
+        const target = typeof repo === 'string' && repo.trim() ? repo.trim() : undefined;
+        const latest = await updater.check(target);
+        if (!latest) {
+            throw Object.assign(new Error('无法获取最新版本，请检查网络或稍后重试。'), { code: 'no-latest' });
+        }
+        const result = await updater.update(target, latest.version);
+        return { ...result, latest: latest.version };
     }
     async function dispatch(method, payload) {
         if (method === 'status')
@@ -786,6 +805,8 @@ export function installRpc(ctx, deps) {
             return logsFilePrune(payload);
         if (method === 'version.check')
             return versionCheck();
+        if (method === 'version.update')
+            return versionUpdate();
         throw Object.assign(new Error(`未知操作：${method}`), { code: 'unknown-method' });
     }
     function registerOn(target) {

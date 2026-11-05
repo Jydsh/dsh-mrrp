@@ -29,8 +29,7 @@
   "scripts": {
     "build": "tsc",
     "pack": "npm pack",
-    "test": "node --test",
-    "prepare": "tsc"
+    "test": "node --test"
   },
   "dsh": {
     "bundle": {

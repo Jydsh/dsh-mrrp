@@ -11,8 +11,10 @@
  * 仓库路径（owner/repo）默认取本插件自己的仓库；不同插件仓库不同，
  * 可通过 config.json 的 updateRepo 字段覆盖（例如 "Jydsh/dsh-mrrp"）。
  */
-import { readFileSync } from 'node:fs';
-import { dirname, join } from 'node:path';
+import { spawn } from 'node:child_process';
+import { existsSync, readdirSync, readFileSync } from 'node:fs';
+import { homedir } from 'node:os';
+import { delimiter, dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 /** 本插件默认仓库（与 package.json 发布仓库一致）。 */
 export const DEFAULT_REPO = 'Jydsh/dsh-mrrp';
@@ -82,4 +84,195 @@ export function isAtLeast(current, latest) {
         return false;
     const norm = (v) => v.split('.').map((n) => n.padStart(2, '0')).join('.');
     return norm(current) >= norm(latest);
+}
+/* ---------------------------------------------------------------------------
+ * 一键更新：识别当前安装环境（profile / 安装来源 / 可用 CLI），据此拼出
+ * 对应的安装命令并执行。设计目标是「插件自己知道该怎么更新自己」：
+ *   - dsh CLI 可用时优先走 dsh plugin add（DSH 自己的插件安装入口）
+ *   - 否则回退 pnpm、npm，cwd 固定到 profile 目录
+ *   - 安装来源为 git 的仓库装法时用 github:<repo>#v<ver>，
+ *     从 Release 安装包装的则用 tgz 下载地址
+ * ------------------------------------------------------------------------- */
+/** 在 PATH 中查找可执行文件（Windows 需兼顾 .cmd/.exe/.bat） */
+function findOnPath(name) {
+    const exts = process.platform === 'win32' ? ['.cmd', '.exe', '.bat', ''] : ['', '.sh'];
+    const dirs = (process.env.PATH ?? process.env.Path ?? '').split(delimiter).filter(Boolean);
+    for (const dir of dirs) {
+        for (const ext of exts) {
+            const full = join(dir, name + ext);
+            try {
+                if (existsSync(full))
+                    return full;
+            }
+            catch {
+                /* 忽略不可访问目录 */
+            }
+        }
+    }
+    return null;
+}
+/** 本包根目录（…/node_modules/dsh-mrrp） */
+function packageRoot() {
+    return resolve(dirname(fileURLToPath(import.meta.url)), '..');
+}
+/** 读本包 package.json 的 name / version */
+function selfMeta() {
+    try {
+        const pkg = JSON.parse(readFileSync(join(packageRoot(), 'package.json'), 'utf8'));
+        return { name: String(pkg.name ?? 'dsh-mrrp'), version: String(pkg.version ?? '') };
+    }
+    catch {
+        return { name: 'dsh-mrrp', version: '' };
+    }
+}
+/**
+ * 定位当前插件所在的 profile 目录。
+ * 不能只看自身安装路径：开发态常用 junction / 链接安装，Node 会把
+ * import.meta.url 解析成真实路径（例如 D:\dsh\dsh-mrrp），从而完全看不出 profile。
+ * 所以先按 DSH_HOME/profiles 扫描哪个 profile 装了本包，再回退到路径推断。
+ */
+function resolveProfile(packageName) {
+    const dshHome = process.env.DSH_HOME
+        ? resolve(process.env.DSH_HOME)
+        : join(homedir(), '.dsh');
+    const profilesDir = join(dshHome, 'profiles');
+    const fromEnv = (process.env.DSH_PROFILE ?? '').trim();
+    const installed = (name) => existsSync(join(profilesDir, name, 'node_modules', packageName, 'package.json'));
+    let candidates = [];
+    try {
+        candidates = readdirSync(profilesDir, { withFileTypes: true })
+            .filter((entry) => entry.isDirectory() || entry.isSymbolicLink())
+            .map((entry) => entry.name);
+    }
+    catch {
+        /* profiles 目录不可读，走路径推断 */
+    }
+    if (fromEnv && installed(fromEnv))
+        return { profile: fromEnv, profileDir: join(profilesDir, fromEnv) };
+    const hit = candidates.find(installed);
+    if (hit)
+        return { profile: hit, profileDir: join(profilesDir, hit) };
+    // 回退：…/.dsh/profiles/<profile>/node_modules/<pkg>
+    const fallbackDir = dirname(dirname(packageRoot()));
+    const match = /[\\/]\.dsh[\\/]profiles[\\/]([^\\/]+)$/i.exec(fallbackDir);
+    if (match)
+        return { profile: match[1], profileDir: fallbackDir };
+    return { profile: null, profileDir: null };
+}
+/**
+ * 识别当前安装环境并生成对应安装命令。
+ * @param repo 仓库路径（owner/repo），缺省 DEFAULT_REPO
+ * @param version 目标版本，缺省本包 package.json 的 version
+ */
+export function detectInstallEnv(repo, version) {
+    const meta = selfMeta();
+    const rawRepo = (repo ?? '').trim() || DEFAULT_REPO;
+    const safeRepo = /^[\w.-]+\/[\w.-]+$/.test(rawRepo) ? rawRepo : DEFAULT_REPO;
+    const safeVersion = normalizeVersion(version) ?? normalizeVersion(meta.version) ?? meta.version;
+    const { profile, profileDir } = resolveProfile(meta.name);
+    // 安装来源：看 profile 的 package.json 里本包是怎么声明的
+    let declared = null;
+    if (profileDir) {
+        try {
+            const pkg = JSON.parse(readFileSync(join(profileDir, 'package.json'), 'utf8'));
+            declared = pkg.dependencies?.[meta.name] ?? pkg.devDependencies?.[meta.name] ?? null;
+        }
+        catch {
+            /* profile 的 package.json 读不到，按 unknown 处理 */
+        }
+    }
+    let source = 'unknown';
+    if (declared) {
+        if (/github:|codeload\.github\.com|\.git(?:#|$)/i.test(declared))
+            source = 'git';
+        else if (/\.tgz|\.tar\.gz|file:/i.test(declared))
+            source = 'tgz';
+    }
+    const tgzSpec = `https://github.com/${safeRepo}/releases/download/v${safeVersion}/${meta.name}-${safeVersion}.tgz`;
+    // 装法不明时默认走 Release 安装包：tgz 不受 pnpm 的 git 依赖脚本白名单限制
+    const spec = source === 'git' ? `github:${safeRepo}#v${safeVersion}` : tgzSpec;
+    const cli = findOnPath('dsh')
+        ? 'dsh'
+        : findOnPath('pnpm')
+            ? 'pnpm'
+            : findOnPath('npm')
+                ? 'npm'
+                : null;
+    let command = '';
+    let blocker = null;
+    if (cli === 'dsh') {
+        // profile 识别不出来时不强行指定，交给 dsh 的默认 profile
+        command = profile
+            ? `dsh plugin --profile ${profile} add "${spec}"`
+            : `dsh plugin add "${spec}"`;
+    }
+    else if (cli === 'pnpm') {
+        command = `pnpm add "${spec}"`;
+    }
+    else if (cli === 'npm') {
+        command = `npm add "${spec}"`;
+    }
+    else {
+        blocker = '未找到 dsh / pnpm / npm 命令，无法自动执行安装，请按命令手工更新';
+    }
+    return { platform: process.platform, profile, profileDir, source, cli, spec, command, blocker };
+}
+/**
+ * 执行一键更新：按识别出的环境跑安装命令。
+ * 注意：安装会替换当前进程正在使用的插件文件，成功后仍需要重启 DSH 才加载新代码。
+ */
+export async function runUpdate(repo, version, timeoutMs = 180_000) {
+    const env = detectInstallEnv(repo, version);
+    if (env.blocker || !env.command) {
+        return {
+            ok: false,
+            exitCode: null,
+            command: env.command,
+            output: env.blocker ?? '无法执行更新',
+            env,
+            restartRequired: false,
+        };
+    }
+    const cwd = env.profileDir && existsSync(env.profileDir) ? env.profileDir : packageRoot();
+    const outcome = await new Promise((done) => {
+        let output = '';
+        const push = (chunk) => {
+            output = (output + String(chunk)).slice(-5000);
+        };
+        let child;
+        try {
+            child = spawn(env.command, { cwd, shell: true, windowsHide: true, env: process.env });
+        }
+        catch (error) {
+            done({ code: null, output: `启动失败：${error?.message ?? String(error)}` });
+            return;
+        }
+        const timer = setTimeout(() => {
+            try {
+                child.kill();
+            }
+            catch {
+                /* 已退出 */
+            }
+            push(`\n[超时] 安装进程超过 ${Math.round(timeoutMs / 1000)}s 被终止`);
+        }, timeoutMs);
+        child.stdout?.on('data', push);
+        child.stderr?.on('data', push);
+        child.on('error', (error) => {
+            clearTimeout(timer);
+            done({ code: null, output: `启动失败：${error.message}` });
+        });
+        child.on('close', (code) => {
+            clearTimeout(timer);
+            done({ code, output });
+        });
+    });
+    return {
+        ok: outcome.code === 0,
+        exitCode: outcome.code,
+        command: env.command,
+        output: outcome.output,
+        env,
+        restartRequired: outcome.code === 0,
+    };
 }

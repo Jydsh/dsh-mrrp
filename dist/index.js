@@ -7,7 +7,7 @@ import { makeImReader } from './dshim.js';
 import { createImRouting, pruneRouteLogDir, pruneRouteLogFile, routeLogPathFor } from './route-engine.js';
 import { readDingtalkBridgeSessions } from './dingtalk-bridge.js';
 import { createRouteAdapter } from './route-adapter.js';
-import { checkLatestVersion, getCurrentVersion, isAtLeast } from './updater.js';
+import { checkLatestVersion, detectInstallEnv, getCurrentVersion, isAtLeast, runUpdate } from './updater.js';
 /**
  * dsh-mrrp: MRRP（Model Routing & Resource Planning）控制台插件。
  *
@@ -138,7 +138,13 @@ export async function apply(ctx, config = {}) {
         store, llm, logger, im,
         imRoutingStatus: () => imRouting.status(),
         logDir: routeLogDir,
-        updater: { current: getCurrentVersion, check: checkLatestVersion, isAtLeast },
+        updater: {
+            current: getCurrentVersion,
+            check: checkLatestVersion,
+            isAtLeast,
+            detect: detectInstallEnv,
+            update: runUpdate,
+        },
     });
     try {
         rpc.install();
