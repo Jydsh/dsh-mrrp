@@ -42,13 +42,14 @@ function baseOf(url: string): string {
   return (url ?? '').trim().replace(/\/+$/, '');
 }
 
-/** Laya 提供方的决策请求 URL 与请求体（systemone = 本地；decisions = 0G 云端）。 */
-function layaDecisionRequest(provider: ProviderLike, body: Record<string, unknown>) {
+/** Laya 提供方的决策请求 URL 与请求体（systemone = 本地；decisions = 0G 云端）。
+ *  model 非空时请求体带 model 字段（OpenAI 兼容 / 云端判定型提供方需指定判定模型名）。 */
+function layaDecisionRequest(provider: ProviderLike, body: Record<string, unknown>, model?: string) {
   const base = baseOf(provider.baseUrl ?? '');
   if (provider.endpoint === 'decisions') {
-    return { url: `${base}/v1/decisions`, body: { model: 'laya', ...body } };
+    return { url: `${base}/v1/decisions`, body: { model: model || 'laya', ...body } };
   }
-  return { url: `${base}/v1/systemone`, body };
+  return { url: `${base}/v1/systemone`, body: model ? { model, ...body } : body };
 }
 
 function authHeaders(apiKey: string): Record<string, string> {
@@ -120,7 +121,7 @@ export async function testProvider(provider: ProviderLike): Promise<{ ok: boolea
  * 决策慢 / 不可达时快速落兜底，避免用户干等。
  */
 export function makeLayaDecide(
-  resolve: () => { baseUrl: string; apiKey: string; endpoint?: string } | null,
+  resolve: () => { baseUrl: string; apiKey: string; endpoint?: string; model?: string } | null,
   timeoutMs = 30_000,
 ) {
   return async (input: unknown): Promise<unknown> => {
@@ -130,12 +131,73 @@ export function makeLayaDecide(
     const endpoint = resolve();
     if (!endpoint) throw new Error('未配置 Laya 服务：请在 MRRP 控制台「模型路由配置 → 决策模型绑定」中新增并启用 Laya 提供方。');
     const questions = source.questions && typeof source.questions === 'object' ? source.questions : defaultLayaQuestions();
-    const { url, body } = layaDecisionRequest(endpoint, { state, questions });
+    const { url, body } = layaDecisionRequest(endpoint, { state, questions }, endpoint.model);
     const data = await jsonFetch(url, {
       method: 'POST',
       headers: { 'content-type': 'application/json', ...authHeaders(endpoint.apiKey) },
       body: JSON.stringify(body),
     }, timeoutMs);
     return data;
+  };
+}
+
+/** 从 OpenAI 兼容 chat 响应（choices[0].message.content）中提取判定 choice 与 reasoning。 */
+export function extractChatChoice(data: unknown): { choice: string; reasoning: string } {
+  const root = (data && typeof data === 'object' ? data : {}) as Record<string, any>;
+  const choices = Array.isArray(root.choices) ? root.choices : [];
+  const content = String(choices[0]?.message?.content ?? '').trim();
+  // 去 ```json 围栏
+  const jsonText = content.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, '').trim();
+  try {
+    const parsed = JSON.parse(jsonText) as Record<string, unknown>;
+    if (typeof parsed.choice === 'string' && parsed.choice.trim()) {
+      return { choice: parsed.choice.trim(), reasoning: typeof parsed.reasoning === 'string' ? parsed.reasoning.trim() : '' };
+    }
+  } catch {
+    // 非严格 JSON，走正则兜底
+  }
+  const choiceMatch = content.match(/"choice"\s*:\s*"([^"]+)"/) || content.match(/"choice"\s*:\s*([^,\s}]+)/);
+  if (choiceMatch && choiceMatch[1]) return { choice: choiceMatch[1].trim(), reasoning: '' };
+  throw new Error(`判定输出未包含有效 choice（模型返回：${content.slice(0, 120) || '空' }）。`);
+}
+
+/**
+ * OpenAI 兼容对话判定（format=openai/generic 且 endpoint=chat）：
+ * 把判定问题（state + questions）交给普通 OpenAI 兼容模型，要求其输出
+ * {"choice":"<候选 key>","reasoning":"..."}，再解析为标准 Laya 判定响应形状，
+ * 供上层（extractDecisionValues / pickedModelFrom / 日志）直接复用。
+ */
+export function openaiChatDecide(
+  resolve: () => { baseUrl: string; apiKey: string; model: string } | null,
+  timeoutMs = 10_000,
+) {
+  return async (input: unknown): Promise<unknown> => {
+    const source = (input && typeof input === 'object' ? input : {}) as Record<string, any>;
+    const state = typeof source.state === 'string' ? source.state : '';
+    if (!state.trim()) throw new Error('参数 state 必填：传入待判断的文本。');
+    const ep = resolve();
+    if (!ep) throw new Error('未配置决策模型服务：请在 MRRP 控制台「模型路由配置 → 决策模型绑定」中新增并启用提供方。');
+    if (!ep.model) throw new Error('未配置判定模型名：请在提供方「模型列表」中填入要用于判定的模型名。');
+    const questions = source.questions && typeof source.questions === 'object' ? source.questions : defaultLayaQuestions();
+    const url = `${baseOf(ep.baseUrl)}/chat/completions`;
+    const system = '你是模型路由判定器。根据「待判定文本 state」与「判定问题 questions」，从每个问题的候选（criteria 的 key）中选出最合适的 key。只输出一个严格 JSON 对象：{"choice":"<选择的 key>","reasoning":"<一句话理由>"}，不要输出其它内容。';
+    const data = await jsonFetch(url, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', ...authHeaders(ep.apiKey) },
+      body: JSON.stringify({
+        model: ep.model,
+        messages: [
+          { role: 'system', content: system },
+          { role: 'user', content: JSON.stringify({ state, questions }) },
+        ],
+        temperature: 0,
+      }),
+    }, timeoutMs);
+    const { choice, reasoning } = extractChatChoice(data);
+    // 标准化为 Laya 判定响应形状（answers.model.choice），上层解析与日志直接复用
+    return {
+      model: { id: ep.model, repo: 'openai-compat' },
+      answers: { model: { type: 'choice', choice, reasoning } },
+    };
   };
 }

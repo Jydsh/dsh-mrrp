@@ -1,5 +1,5 @@
-import type { CategoryBinding, ImRouteConfig, ImRouteQuestion, PluginConfig } from './store.js';
-import { makeLayaDecide } from './decision.js';
+import type { CategoryBinding, DecisionProvider, ImRouteConfig, ImRouteQuestion, PluginConfig } from './store.js';
+import { makeLayaDecide, openaiChatDecide } from './decision.js';
 import { readFileSync, readdirSync, unlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 
@@ -49,8 +49,10 @@ export interface RoutingLogger {
 export interface ImRoutingDeps {
   getConfig(): PluginConfig;
   logger?: RoutingLogger;
-  /** 决策执行器（测试可注入；缺省按 decisionProviderId 走 laya 提供方） */
+  /** 决策执行器（测试可注入；缺省按 decisionProviderId / decisionProviderIds 走 laya 提供方，多提供方负载均衡 + 故障转移） */
   decide?: (state: string, questions: Record<string, ImRouteQuestion>) => Promise<unknown>;
+  /** 多提供方决策执行器（createDecisionRunner；缺省由 resolveTargetModelFromPool 按配置自建） */
+  decisionRunner?: DecisionRunner;
   /**
    * 决策过程追踪（路由决策日志用）：在调用决策模型前后 / 出错时回调，
    * detail 含发送给 laya 的请求（state/questions/提供方）与原始响应 / 错误。
@@ -79,6 +81,28 @@ export interface TargetModelOutcome {
   decision?: Record<string, string>;
   /** laya 给出的选择理由（reasoning），供路由日志展示 */
   reasoning?: string;
+  /** 实际执行决策的提供方 id（source=laya 时存在；多提供方轮询/故障转移后记录） */
+  providerId?: string;
+  /** 本次决策是否经过故障转移（首个提供方失败后换下一个成功，source=laya 时记录） */
+  failover?: boolean;
+  /** 附件能力硬校验是否改选了模型（决策模型把带附件消息判给无能力模型时强制校正） */
+  attachmentOverride?: boolean;
+}
+
+/**
+ * 用户可用模型池（决策输入的**可缓存部分**）：
+ * 用户命中 + 直接角色 / 部门继承候选，与「消息内容 / Laya 决策」无关。
+ * adapter 按 发送者 + 配置指纹 缓存本池，每条消息只做 Laya 决策，不再重复组装候选。
+ */
+export interface UserModelPool {
+  /** 用户是否在用户表命中（未命中时由调用方按 unknownUser 策略处理） */
+  userFound: boolean;
+  /** 命中的用户记录（姓名用于决策问题上下文） */
+  user?: PluginConfig['users'][number];
+  /** 直接角色候选（显式授权，排序在前） */
+  direct: string[];
+  /** 部门继承候选（并集补充） */
+  inherited: string[];
 }
 
 export interface ImRoutingHandle {
@@ -397,6 +421,131 @@ export function parseModelKey(key: string): { provider: string; model: string } 
   return { provider, model };
 }
 
+/** 生成路径的候选选择超时：决策慢 / 不可达时快速落兜底，避免用户干等。 */
+const DECISION_TIMEOUT_MS = 6000;
+/** OpenAI 兼容对话判定超时（普通大模型推理比 laya 判定慢，放宽到 10s）。 */
+const CHAT_DECISION_TIMEOUT_MS = 10_000;
+
+/** 决策执行结果：Laya 原始响应 + 实际使用的提供方 + 是否故障转移。 */
+export interface DecisionRunResult {
+  data: unknown;
+  providerId: string;
+  failover: boolean;
+}
+
+/** 多提供方决策执行器：负载均衡（轮询）+ 故障转移（按序换用）。 */
+export interface DecisionRunner {
+  run(opts: {
+    providerIds: string[];
+    state: string;
+    questions: Record<string, ImRouteQuestion>;
+    onDecide?: (phase: 'before' | 'after' | 'error', detail: Record<string, unknown>) => void;
+  }): Promise<DecisionRunResult | null>;
+}
+
+/** 生效的决策提供方有序列表：优先 imRoute.decisionProviderIds，空则回退 [decisionProviderId]。 */
+export function effectiveDecisionProviderIds(cfg: ImRouteConfig | undefined): string[] {
+  if (!cfg) return [];
+  const list = Array.isArray(cfg.decisionProviderIds) && cfg.decisionProviderIds.length
+    ? cfg.decisionProviderIds
+    : (cfg.decisionProviderId ? [cfg.decisionProviderId] : []);
+  return list.filter((id) => typeof id === 'string' && id.trim()).map((id) => id.trim());
+}
+
+/**
+ * 创建决策执行器：多提供方「负载均衡（轮询起始）+ 故障转移（失败按序换下一个）」。
+ * - decide 注入（测试）：直接单次调用，providerId 取列表首个；
+ * - execute 注入（测试）：替换真实 makeLayaDecide 网络调用，便于断言轮询 / 转移；
+ * - 缺省：从 config.decisionProviders 匹配启用的 laya 提供方（format=laya 且 baseUrl 非空）。
+ */
+export function createDecisionRunner(ctx: {
+  getConfig(): PluginConfig;
+  decide?: ImRoutingDeps['decide'];
+  execute?: (provider: DecisionProvider, state: string, questions: Record<string, ImRouteQuestion>, timeoutMs: number) => Promise<unknown>;
+}): DecisionRunner {
+  const providersOf = (config: PluginConfig, ids: string[]): DecisionProvider[] => {
+    const out: DecisionProvider[] = [];
+    for (const id of ids) {
+      const provider = config.decisionProviders.find((item) => item.id === id);
+      // 决策提供方支持 laya 与 OpenAI 兼容格式（openai / generic）：
+      // 云端判定型服务（如阿里云 MaaS compatible-mode/systemone、0G decisions）走同一判定协议，
+      // 请求体按格式带判定模型名（modelNames[0]）。
+      if (provider && provider.baseUrl && (provider.format === 'laya' || provider.format === 'openai' || provider.format === 'generic')) out.push(provider);
+    }
+    return out;
+  };
+  let rr = 0;
+  return {
+    async run({ providerIds, state, questions, onDecide }) {
+      const ids = providerIds.filter(Boolean);
+      if (!ids.length) return null;
+      // 测试注入：直接走 decide（单次）
+      if (typeof ctx.decide === 'function') {
+        try {
+          onDecide?.('before', { providerId: ids[0], state, questions, timeoutMs: DECISION_TIMEOUT_MS });
+          const data = await ctx.decide(state, questions);
+          onDecide?.('after', { providerId: ids[0], raw: data });
+          return { data, providerId: ids[0], failover: false };
+        } catch (error) {
+          onDecide?.('error', { providerId: ids[0], message: (error as Error)?.message ?? String(error) });
+          return null;
+        }
+      }
+      // 真实路径：过滤启用的决策提供方（laya / openai / generic，baseUrl 非空）
+      const providers = providersOf(ctx.getConfig(), ids);
+      if (!providers.length) {
+        onDecide?.('error', { providerId: ids[0], message: '未找到启用的决策提供方（format=laya/openai/generic 且 baseUrl 非空）' });
+        return null;
+      }
+      // 负载均衡：轮询挑起始提供方；故障转移：失败按序换下一个
+      const start = (rr % providers.length);
+      rr += 1;
+      for (let i = 0; i < providers.length; i += 1) {
+        const provider = providers[(start + i) % providers.length];
+        const failover = i > 0;
+        try {
+          onDecide?.('before', {
+            providerId: provider.id,
+            provider: { baseUrl: provider.baseUrl, endpoint: provider.endpoint, format: provider.format },
+            state,
+            questions,
+            timeoutMs: DECISION_TIMEOUT_MS,
+            failover,
+          });
+          let data: unknown;
+          if (ctx.execute) {
+            data = await ctx.execute(provider, state, questions, DECISION_TIMEOUT_MS);
+          } else if (provider.endpoint === 'chat') {
+            // OpenAI 兼容对话判定：普通大模型当判定器（format=openai/generic，无判定协议端点）
+            const run = openaiChatDecide(() => ({
+              baseUrl: provider.baseUrl,
+              apiKey: provider.apiKey || '',
+              model: (provider.modelNames?.[0] || '').trim(),
+            }), CHAT_DECISION_TIMEOUT_MS);
+            data = await run({ state, questions });
+          } else {
+            // 判定协议（systemone / decisions）：云端判定型服务请求体带判定模型名（modelNames[0]），
+            // 如阿里云 MaaS 的 decision-model-preview；本地 laya 不带 model 字段。
+            const decisionModel = provider.format === 'laya' ? '' : (provider.modelNames?.[0] || '').trim();
+            const run = makeLayaDecide(() => ({
+              baseUrl: provider.baseUrl,
+              apiKey: provider.apiKey || '',
+              endpoint: provider.endpoint,
+              model: decisionModel || undefined,
+            }), DECISION_TIMEOUT_MS);
+            data = await run({ state, questions });
+          }
+          onDecide?.('after', { providerId: provider.id, raw: data, failover });
+          return { data, providerId: provider.id, failover };
+        } catch (error) {
+          onDecide?.('error', { providerId: provider.id, message: (error as Error)?.message ?? String(error), failover });
+        }
+      }
+      return null;
+    },
+  };
+}
+
 /** 内置判定问题：让 laya 在候选模型里选一个（插件内置，用户不再配置）。
  *  候选带类型/擅长场景（来自分类画像）后，criteria 值 = 「名称（类型：…；擅长：…）」，
  *  Laya 可依据类型语义做决策，不再只靠模型名猜测。 */
@@ -420,12 +569,23 @@ export function builtinModelChoiceQuestion(
   };
 }
 
+/** 收集用户可用模型池（决策上下文缓存用）：用户命中 + 直接角色 / 部门继承候选。 */
+export function collectUserModelPool(config: PluginConfig, senderId: string): UserModelPool {
+  const user = config.users.find((item) => item.id === senderId);
+  if (!user) return { userFound: false, direct: [], inherited: [] };
+  const { direct, inherited } = collectUserModelsPrioritized(config, user);
+  return { userFound: true, user, direct, inherited };
+}
+
 /**
  * 目标模型决策（纯逻辑，无副作用；导出供测试）。
  *
  * 顺序：未注册用户（unknownUser）→ 用户可用模型池（角色 + 部门，去重）→
  *   池空用兜底；池唯一直接用；池多个用内置判定问题请决策模型（laya）选择 →
  *   决策失败 / 未命中用兜底。
+ *
+ * 候选池可经 collectUserModelPool 缓存（决策输入复用），每次消息仍执行本决策：
+ * 候选多时每次都让 Laya 按消息内容选择模型，不再按会话锁死已决策模型。
  */
 export async function resolveTargetModel(
   deps: ImRoutingDeps,
@@ -434,18 +594,100 @@ export async function resolveTargetModel(
   text: string,
 ): Promise<TargetModelOutcome | null> {
   const config = deps.getConfig();
+  return resolveTargetModelFromPool(collectUserModelPool(config, senderId), deps, cfg, senderId, text);
+}
+
+/** 附件类型合法值（决策提示用，防止任意字符串污染判定问题）。 */
+const ATTACHMENT_TYPES = new Set(['image', 'video', 'file', 'audio']);
+
+/** 附件类型 → 中文标签（用于决策提示）。 */
+const ATTACHMENT_LABELS: Record<string, string> = {
+  image: '图片',
+  video: '视频',
+  file: '文件',
+  audio: '音频',
+};
+
+/**
+ * 构造附件能力提示：仅当消息带附件时追加。
+ * 决策模型不需要理解附件内容——只按「附件类型 → 需要对应输入能力的模型」决策。
+ */
+export function attachmentContextHint(attachments?: string[]): string {
+  const types = (attachments || [])
+    .map((t) => String(t).trim().toLowerCase())
+    .filter((t) => ATTACHMENT_TYPES.has(t));
+  if (!types.length) return '';
+  const labels = [...new Set(types)].map((t) => ATTACHMENT_LABELS[t] || t).join('、');
+  return ` 本条消息包含附件：${labels}。决策目标：优先选择候选模型中「能处理该类输入」的模型（候选类型/擅长场景中标注了 多模态/图片/视频/文件/音频 等能力标签的优先；若候选均无对应能力，再按任务语义选择最合适的模型）。`;
+}
+
+/**
+ * 模型画像类型文本：控制台手动维护的 modelProfiles.type（多选数组）优先，
+ * 未配置则取模型所在分类的「名称」兜底；返回 undefined 表示无任何类型标注。
+ */
+export function profileTypeText(config: PluginConfig, key: string): string | undefined {
+  const profile = config.modelProfiles?.[key];
+  const hits = config.categories.filter((category) => category.modelIds.includes(key));
+  const profileTypes = Array.isArray(profile?.type)
+    ? (profile.type as string[]).filter(Boolean)
+    : (typeof profile?.type === 'string' && (profile.type as string).trim() ? [(profile.type as string).trim()] : []);
+  return profileTypes.length ? profileTypes.join('、') : hits.map((category) => category.name).join('、') || undefined;
+}
+
+/** 附件能力关键词：画像/分类类型文本命中任一即视为「可处理该附件输入」。 */
+const ATTACHMENT_CAPABILITY_HINTS = ['多模态', '图片', '视觉', '图像', '视频', '文件', '文档', '音频', '语音', 'vision', 'image', 'multimodal', 'video', 'file', 'audio'];
+
+export function hasAttachmentCapability(typeText: string | undefined): boolean {
+  if (!typeText) return false;
+  const t = typeText.toLowerCase();
+  return ATTACHMENT_CAPABILITY_HINTS.some((h) => t.includes(h.toLowerCase()));
+}
+
+/**
+ * 附件能力硬校验：决策模型（如本地 laya）可能无视附件提示、不读能力标签，
+ * 把带附件消息判给无对应能力的模型（实测：对候选第一位有强位置偏见）。
+ * 规则：被选模型画像/分类已含能力标签 → 不干预；否则改选候选池中第一个
+ * 含能力标签的模型（直接授权在前）；池内确无能力模型 → 返回 null 保持原决策。
+ */
+export function enforceAttachmentCapability(
+  picked: string,
+  candidates: string[],
+  config: PluginConfig,
+  attachments?: string[],
+): string | null {
+  if (!attachmentContextHint(attachments)) return null;
+  if (hasAttachmentCapability(profileTypeText(config, picked))) return null;
+  return candidates.find((key) => key !== picked && hasAttachmentCapability(profileTypeText(config, key))) ?? null;
+}
+
+/**
+ * 目标模型决策主流程（候选池已就绪）：
+ *   池空用兜底；池唯一直接用；池多个用内置判定问题请决策模型（laya）选择 →
+ *   决策失败 / 未命中用兜底。
+ *
+ * attachments：本条消息携带的附件类型（image / video / file / audio 等，可空）。
+ * 决策模型无需理解附件内容——判定问题会带上「本条消息包含 XX 附件」提示，
+ * 让 Laya 优先选择候选画像中标注了对应能力（多模态 / 图片 / 视频 / 文件）的模型。
+ */
+export async function resolveTargetModelFromPool(
+  pool: UserModelPool,
+  deps: ImRoutingDeps,
+  cfg: ImRouteConfig,
+  senderId: string,
+  text: string,
+  attachments?: string[],
+): Promise<TargetModelOutcome | null> {
+  const config = deps.getConfig();
 
   // 1. 未注册用户
-  const user = config.users.find((item) => item.id === senderId);
-  if (!user) {
+  if (!pool.userFound) {
     if (cfg.unknownUser !== 'fallback' || !cfg.fallbackModel) return null;
     return { model: cfg.fallbackModel, source: 'unknown-fallback', candidates: [], sources: { direct: [], inherited: [] } };
   }
 
   // 2. 用户可用模型池（方案 B：直接角色在前 = 显式授权最高；部门继承并集补充）
-  const { direct, inherited } = collectUserModelsPrioritized(config, user);
-  const candidates = [...direct, ...inherited];
-  const sources = { direct, inherited };
+  const candidates = [...pool.direct, ...pool.inherited];
+  const sources = { direct: pool.direct, inherited: pool.inherited };
   if (candidates.length === 0) {
     if (cfg.fallbackModel) return { model: cfg.fallbackModel, source: 'fallback', candidates, sources };
     return null;
@@ -454,72 +696,43 @@ export async function resolveTargetModel(
     return { model: candidates[0], source: 'user', candidates, sources };
   }
 
-  // 3. 多个候选：内置判定问题请决策模型选择
-  if (!cfg.decisionProviderId) {
+  // 3. 多个候选：内置判定问题请决策模型选择（多提供方：负载均衡轮询 + 故障转移）
+  const providerIds = effectiveDecisionProviderIds(cfg);
+  if (!providerIds.length) {
     if (cfg.fallbackModel) return { model: cfg.fallbackModel, source: 'fallback', candidates, sources };
     return null;
   }
   const question = builtinModelChoiceQuestion(candidates.map((key) => {
     const parsed = parseModelKey(key);
-    // 模型画像：优先用控制台手动维护的 modelProfiles（type 多选数组），未配置则取模型所在分类的「名称 + 描述」
-    const profile = config.modelProfiles?.[key];
-    const hits = config.categories.filter((category) => category.modelIds.includes(key));
-    const profileTypes = Array.isArray(profile?.type)
-      ? (profile.type as string[]).filter(Boolean)
-      : (typeof profile?.type === 'string' && (profile.type as string).trim() ? [(profile.type as string).trim()] : []);
-    const type = profileTypes.length ? profileTypes.join('、') : hits.map((category) => category.name).join('、') || undefined;
-    const scene = profile?.scene || hits.map((category) => category.desc).filter(Boolean).join('；') || undefined;
+    const type = profileTypeText(config, key);
+    // 擅长场景：手动画像优先；未配置时回退到模型绑定分类的描述（同一分类的模型共用同一段擅长文案）。
+    const scene = config.modelProfiles?.[key]?.scene || config.categories.filter((category) => category.modelIds.includes(key)).map((category) => category.desc).filter(Boolean).join('；') || undefined;
     return { key, name: parsed ? parsed.model : key, type, scene };
-  }), `发送者：${user.name || senderId}；候选授权来源：用户直接角色 ${direct.length} 个模型 / 部门继承 ${inherited.length} 个模型。`);
-  // 生成路径的候选选择用短超时（6s）：决策慢 / 不可达时快速落兜底，避免用户干等
-  const DECISION_TIMEOUT_MS = 6000;
+  }), `发送者：${pool.user?.name || senderId}；候选授权来源：用户直接角色 ${pool.direct.length} 个模型 / 部门继承 ${pool.inherited.length} 个模型。${attachmentContextHint(attachments)}`);
   const questions = { model: question };
   const state = text || senderId;
-  let data: unknown = null;
-  if (typeof deps.decide === 'function') {
-    try {
-      deps.onDecide?.('before', { providerId: cfg.decisionProviderId, state, questions, timeoutMs: DECISION_TIMEOUT_MS });
-      data = await deps.decide(state, questions);
-      deps.onDecide?.('after', { providerId: cfg.decisionProviderId, raw: data });
-    } catch (error) {
-      deps.onDecide?.('error', { providerId: cfg.decisionProviderId, message: (error as Error)?.message ?? String(error) });
-      log(deps, 'warn', `决策模型选择失败：${(error as Error)?.message ?? error}`);
-    }
-  } else {
-    const provider = config.decisionProviders.find((item) => item.id === cfg.decisionProviderId);
-    if (provider && provider.format === 'laya' && provider.baseUrl) {
-      try {
-        deps.onDecide?.('before', {
-          providerId: provider.id,
-          provider: { baseUrl: provider.baseUrl, endpoint: provider.endpoint, format: provider.format },
-          state,
-          questions,
-          timeoutMs: DECISION_TIMEOUT_MS,
-        });
-        const run = makeLayaDecide(() => ({
-          baseUrl: provider.baseUrl,
-          apiKey: provider.apiKey || '',
-          endpoint: provider.endpoint,
-        }), DECISION_TIMEOUT_MS);
-        data = await run({ state, questions });
-        deps.onDecide?.('after', { providerId: provider.id, raw: data });
-      } catch (error) {
-        deps.onDecide?.('error', { providerId: provider.id, message: (error as Error)?.message ?? String(error) });
-        log(deps, 'warn', `决策模型选择失败：${(error as Error)?.message ?? error}`);
-      }
-    } else {
-      deps.onDecide?.('error', { providerId: cfg.decisionProviderId, message: '未找到启用的 laya 决策提供方（format=laya 且 baseUrl 非空）' });
-      log(deps, 'warn', '请选择一个启用的 Laya 决策模型提供方用于候选模型选择。');
-    }
-  }
-  if (data !== null) {
-    const decision = extractDecisionValues(data);
+  const runner = deps.decisionRunner ?? createDecisionRunner({ getConfig: deps.getConfig, decide: deps.decide });
+  const result = await runner.run({
+    providerIds,
+    state,
+    questions,
+    onDecide: deps.onDecide ? ((phase, detail) => deps.onDecide?.(phase, detail)) : undefined,
+  });
+  if (result) {
+    const decision = extractDecisionValues(result.data);
     // 内置判定问题是 choice 类型，答案在 choice 字段；model 字段可能是 Laya 响应的
     // 服务/路由元数据（如 laya-rl-agent / multilingual），不能直接当作判定值。
     // 按「在候选池中匹配」优先取 choice，避免被元数据污染导致决策成功却误判失败。
     const picked = [decision.choice, decision.model].find((v) => v && candidates.includes(v)) ?? '';
     if (picked) {
-      return { model: picked, source: 'laya', candidates, sources, decision, reasoning: extractReasoning(data) };
+      // 附件能力硬校验：本地 laya 实测无视附件提示、对候选第一位有强位置偏见，
+      // 带图消息可能被判给无视觉能力的模型——此处强制校正（日志 attachment-override）。
+      const overridden = enforceAttachmentCapability(picked, candidates, config, attachments);
+      if (overridden) {
+        log(deps, 'warn', `附件能力校验：决策选中 ${picked} 无对应附件能力，强制改选 ${overridden}（attachment-override）。`);
+        return { model: overridden, source: 'laya', candidates, sources, decision, reasoning: extractReasoning(result.data), providerId: result.providerId, failover: result.failover, attachmentOverride: true };
+      }
+      return { model: picked, source: 'laya', candidates, sources, decision, reasoning: extractReasoning(result.data), providerId: result.providerId, failover: result.failover };
     }
     log(deps, 'warn', `决策结果未命中候选模型（${picked || '(空)'}），回退兜底模型。`);
   }
@@ -689,6 +902,7 @@ export function createImRouting(ctx: RoutingCtx, deps: ImRoutingDeps): ImRouting
         subscribed: attached !== null,
         enabled: Boolean(cfg?.enabled),
         decisionProviderId: cfg?.decisionProviderId ?? '',
+        decisionProviderIds: effectiveDecisionProviderIds(cfg),
         mappedCount,
         mappedSessions: senderBySession.size,
         bridgeSessions: bridgeSessions.size,

@@ -1,5 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import {
   normalizeVersion,
   getCurrentVersion,
@@ -25,8 +26,10 @@ test('normalizeVersion: 拒绝非法版本', () => {
   assert.equal(normalizeVersion('2026-11-04'), null);
 });
 
-test('getCurrentVersion: 读 package.json 返回当前版本 2026.11.04', () => {
-  assert.equal(getCurrentVersion(), '2026.11.04');
+test('getCurrentVersion: 读 package.json 返回当前版本', () => {
+  // 动态取 package.json 的 version，避免每次发版都要改测试断言
+  const pkg = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8'));
+  assert.equal(getCurrentVersion(), pkg.version);
 });
 
 test('isAtLeast: 年月日版本按位比较', () => {

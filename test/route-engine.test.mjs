@@ -19,6 +19,13 @@ import {
   sessionIdOf,
   builtinModelChoiceQuestion,
   resolveTargetModel,
+  collectUserModelPool,
+  resolveTargetModelFromPool,
+  effectiveDecisionProviderIds,
+  createDecisionRunner,
+  attachmentContextHint,
+  enforceAttachmentCapability,
+  hasAttachmentCapability,
   createImRouting,
 } from '../dist/route-engine.js';
 import {
@@ -618,4 +625,319 @@ test('pruneRouteLogDir：删除超过保留天数的按天文件，保留近期�
   assert.equal(pruneRouteLogDir(join(dir, 'nope'), 30), 0);
   assert.equal(pruneRouteLogDir('', 30), 0);
   rmSync(dir, { recursive: true, force: true });
+});
+
+test('collectUserModelPool：用户命中（直接角色 + 部门继承）与未命中', () => {
+  const config = makeConfig();
+  const pool = collectUserModelPool(config, 'staff_001');
+  assert.equal(pool.userFound, true);
+  assert.equal(pool.user.name, '李鹏');
+  assert.deepEqual(pool.direct, []);
+  assert.ok(pool.inherited.includes('dashscope:qwen-turbo'), '部门继承 role_ops 分类模型');
+  assert.ok(pool.inherited.includes('ollama:deepseek-r1'));
+
+  const miss = collectUserModelPool(config, 'unknown_sender');
+  assert.equal(miss.userFound, false);
+  assert.deepEqual(miss.direct, []);
+  assert.deepEqual(miss.inherited, []);
+  assert.equal(miss.user, undefined);
+});
+
+test('resolveTargetModelFromPool：复用候选池，多候选每次消息仍 Laya 决策（不锁死）', async () => {
+  const config = makeConfig();
+  const pool = collectUserModelPool(config, 'staff_001');
+  let calls = 0;
+  const decide = async () => { calls += 1; return { model: { response: { type: 'choice', choice: 'ollama:deepseek-r1' } } }; };
+  const o1 = await resolveTargetModelFromPool(pool, depsFor(config, decide), config.route.imRoute, 'staff_001', '写代码');
+  const o2 = await resolveTargetModelFromPool(pool, depsFor(config, decide), config.route.imRoute, 'staff_001', '闲聊');
+  assert.equal(o1.model, 'ollama:deepseek-r1');
+  assert.equal(o1.source, 'laya');
+  assert.equal(o2.model, 'ollama:deepseek-r1');
+  assert.equal(calls, 2, '复用缓存候选池后每条消息仍执行 Laya 决策');
+});
+
+test('resolveTargetModelFromPool：候选唯一直接用（user 来源）不调决策', async () => {
+  const config = makeConfig();
+  const pool = collectUserModelPool(config, 'staff_002');
+  let calls = 0;
+  const decide = async () => { calls += 1; return { model: { response: { type: 'choice', choice: 'dashscope:qwen-turbo' } } }; };
+  const outcome = await resolveTargetModelFromPool(pool, depsFor(config, decide), config.route.imRoute, 'staff_002', '你好');
+  assert.equal(outcome.source, 'user');
+  assert.equal(outcome.model, 'dashscope:qwen-turbo');
+  assert.equal(calls, 0);
+});
+
+test('resolveTargetModelFromPool：未注册用户按 unknownUser 策略（ignore / fallback）', async () => {
+  const config = makeConfig();
+  const pool = collectUserModelPool(config, 'unknown_sender');
+  assert.equal(await resolveTargetModelFromPool(pool, depsFor(config), config.route.imRoute, 'unknown_sender', '你好'), null);
+
+  const fb = makeConfig({ route: { ...makeConfig().route, imRoute: { ...makeConfig().route.imRoute, unknownUser: 'fallback' } } });
+  const fbPool = collectUserModelPool(fb, 'unknown_sender');
+  const outcome = await resolveTargetModelFromPool(fbPool, depsFor(fb), fb.route.imRoute, 'unknown_sender', '你好');
+  assert.deepEqual(outcome, { model: 'dashscope:qwen-max', source: 'unknown-fallback', candidates: [], sources: { direct: [], inherited: [] } });
+});
+
+test('effectiveDecisionProviderIds：优先有序列表，空则回退单个，清洗非法项', () => {
+  const cfg = makeConfig().route.imRoute;
+  assert.deepEqual(effectiveDecisionProviderIds(cfg), ['dp_laya'], '仅 decisionProviderId 时回退单元素');
+  const multi = { ...cfg, decisionProviderIds: ['dp_a', 'dp_b'] };
+  assert.deepEqual(effectiveDecisionProviderIds(multi), ['dp_a', 'dp_b'], '有序列表优先');
+  assert.deepEqual(effectiveDecisionProviderIds({ ...multi, decisionProviderIds: ['', 'dp_x', ' dp_y '] }), ['dp_x', 'dp_y'], '清洗空项与空白');
+  assert.deepEqual(effectiveDecisionProviderIds(undefined), []);
+  assert.deepEqual(effectiveDecisionProviderIds({ enabled: true }), []);
+});
+
+test('createDecisionRunner：注入 decide 直接单次调用，providerId 取列表首个', async () => {
+  const config = makeConfig();
+  const runner = createDecisionRunner({
+    getConfig: () => config,
+    decide: async () => ({ model: { response: { type: 'choice', choice: 'ollama:deepseek-r1' } } }),
+  });
+  const calls = [];
+  const question = builtinModelChoiceQuestion([{ key: 'ollama:deepseek-r1', name: 'DeepSeek' }]);
+  const result = await runner.run({
+    providerIds: ['dp_laya', 'dp_b'], state: 'hi', questions: { model: question },
+    onDecide: (phase, detail) => calls.push([phase, detail.providerId, detail.failover ?? false]),
+  });
+  assert.ok(result);
+  assert.equal(result.providerId, 'dp_laya');
+  assert.equal(result.failover, false);
+  assert.deepEqual(calls, [['before', 'dp_laya', false], ['after', 'dp_laya', false]]);
+});
+
+test('createDecisionRunner：多提供方负载均衡轮询 + 故障转移换下一个', async () => {
+  const provider = (id, baseUrl) => ({ id, name: id, format: 'laya', endpoint: 'systemone', baseUrl, apiKey: '', modelNames: [], categoryId: '', enabled: true, createdAt: '', updatedAt: '' });
+  const config = makeConfig({ decisionProviders: [provider('dp_a', 'http://a:8000'), provider('dp_b', 'http://b:8000')] });
+  const calls = [];
+  const runner = createDecisionRunner({
+    getConfig: () => config,
+    execute: async (prov) => {
+      calls.push(prov.id);
+      if (prov.id === 'dp_a') throw new Error('a down');
+      return { model: { response: { type: 'choice', choice: 'ollama:deepseek-r1' } } };
+    },
+  });
+  const opts = { providerIds: ['dp_a', 'dp_b'], state: 'hi', questions: {} };
+
+  const r1 = await runner.run(opts);
+  assert.ok(r1);
+  assert.equal(r1.providerId, 'dp_b');
+  assert.equal(r1.failover, true, '首个失败后按序换下一个');
+  const r2 = await runner.run(opts);
+  assert.equal(r2.providerId, 'dp_b');
+  assert.equal(r2.failover, false);
+  assert.deepEqual(calls, ['dp_a', 'dp_b', 'dp_b'], '轮询分摊：第二次起始轮到 dp_b，不再重复打 dp_a');
+});
+
+test('createDecisionRunner：全部提供方失败返回 null', async () => {
+  const provider = (id, baseUrl) => ({ id, name: id, format: 'laya', endpoint: 'systemone', baseUrl, apiKey: '', modelNames: [], categoryId: '', enabled: true, createdAt: '', updatedAt: '' });
+  const config = makeConfig({ decisionProviders: [provider('dp_a', 'http://a:8000'), provider('dp_b', 'http://b:8000')] });
+  const runner = createDecisionRunner({ getConfig: () => config, execute: async () => { throw new Error('down'); } });
+  const r = await runner.run({ providerIds: ['dp_a', 'dp_b'], state: 'hi', questions: {} });
+  assert.equal(r, null);
+});
+
+test('resolveTargetModelFromPool：多提供方决策结果携带 providerId 与故障转移标记', async () => {  const config = makeConfig();
+  const runner = {
+    async run() {
+      return { data: { model: { response: { type: 'choice', choice: 'ollama:deepseek-r1' } } }, providerId: 'dp_b', failover: true };
+    },
+  };
+  const pool = collectUserModelPool(config, 'staff_001');
+  const deps = { getConfig: () => config, logger: quiet, decisionRunner: runner };
+  const outcome = await resolveTargetModelFromPool(pool, deps, config.route.imRoute, 'staff_001', '写代码');
+  assert.equal(outcome.source, 'laya');
+  assert.equal(outcome.model, 'ollama:deepseek-r1');
+  assert.equal(outcome.providerId, 'dp_b');
+  assert.equal(outcome.failover, true);
+});
+
+test('createDecisionRunner：OpenAI 兼容提供方（generic）参与决策，请求体带判定模型名', async () => {
+  const provider = (id, format, modelNames) => ({ id, name: id, format, endpoint: 'systemone', baseUrl: 'https://llm-xxx.aliyuncs.com/compatible-mode', apiKey: 'sk-test', modelNames, categoryId: '', enabled: true, createdAt: '', updatedAt: '' });
+  const config = makeConfig({ decisionProviders: [provider('dp_cloud', 'generic', ['decision-model-preview'])] });
+  const calls = [];
+  const original = globalThis.fetch;
+  globalThis.fetch = async (url, init) => {
+    calls.push({ url: String(url), init });
+    return new Response(JSON.stringify({ model: 'x', answers: { model: { type: 'choice', choice: 'ollama:deepseek-r1' } } }), { status: 200, headers: { 'content-type': 'application/json' } });
+  };
+  try {
+    const runner = createDecisionRunner({ getConfig: () => config });
+    const r = await runner.run({ providerIds: ['dp_cloud'], state: 'hi', questions: {} });
+    assert.ok(r);
+    assert.equal(r.providerId, 'dp_cloud');
+    assert.equal(r.failover, false);
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].url, 'https://llm-xxx.aliyuncs.com/compatible-mode/v1/systemone');
+    const body = JSON.parse(calls[0].init.body);
+    assert.equal(body.model, 'decision-model-preview', 'generic 提供方请求体带判定模型名');
+    assert.match(calls[0].init.headers.authorization, /Bearer sk-test/);
+  } finally { globalThis.fetch = original; }
+});
+
+test('createDecisionRunner：generic + endpoint=chat 走 OpenAI 兼容对话判定', async () => {
+  const config = makeConfig({ decisionProviders: [{ id: 'dp_sf', name: '硅基', format: 'generic', endpoint: 'chat', baseUrl: 'https://api.siliconflow.cn/v1', apiKey: 'sk', modelNames: ['deepseek-ai/DeepSeek-R1'], categoryId: '', enabled: true, createdAt: '', updatedAt: '' }] });
+  const calls = [];
+  const original = globalThis.fetch;
+  globalThis.fetch = async (url, init) => {
+    calls.push({ url: String(url), init });
+    return new Response(JSON.stringify({ choices: [{ message: { content: '{"choice":"ollama:deepseek-r1","reasoning":"深度推理"}' } }] }), { status: 200, headers: { 'content-type': 'application/json' } });
+  };
+  try {
+    const runner = createDecisionRunner({ getConfig: () => config });
+    const r = await runner.run({ providerIds: ['dp_sf'], state: 'hi', questions: {} });
+    assert.ok(r);
+    assert.equal(r.providerId, 'dp_sf');
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].url, 'https://api.siliconflow.cn/v1/chat/completions');
+    const body = JSON.parse(calls[0].init.body);
+    assert.equal(body.model, 'deepseek-ai/DeepSeek-R1');
+    assert.equal(body.temperature, 0);
+    assert.equal(extractDecisionValues(r.data).choice, 'ollama:deepseek-r1', 'chat 判定标准化为 Laya 形状后可被上层解析命中');
+  } finally { globalThis.fetch = original; }
+});
+
+test('createDecisionRunner：endpoint=chat 判定失败时按序故障转移', async () => {
+  const config = makeConfig({ decisionProviders: [
+    { id: 'dp_chat1', name: 'C1', format: 'openai', endpoint: 'chat', baseUrl: 'https://a.example', apiKey: 'k1', modelNames: ['m1'], categoryId: '', enabled: true, createdAt: '', updatedAt: '' },
+    { id: 'dp_chat2', name: 'C2', format: 'openai', endpoint: 'chat', baseUrl: 'https://b.example', apiKey: 'k2', modelNames: ['m2'], categoryId: '', enabled: true, createdAt: '', updatedAt: '' },
+  ] });
+  const calls = [];
+  const original = globalThis.fetch;
+  globalThis.fetch = async (url, init) => {
+    calls.push({ url: String(url) });
+    if (String(url).includes('a.example')) throw new Error('服务响应 500');
+    return new Response(JSON.stringify({ choices: [{ message: { content: '{"choice":"dashscope:qwen-turbo"}' } }] }), { status: 200, headers: { 'content-type': 'application/json' } });
+  };
+  try {
+    const runner = createDecisionRunner({ getConfig: () => config });
+    const r = await runner.run({ providerIds: ['dp_chat1', 'dp_chat2'], state: 'hi', questions: {} });
+    assert.ok(r);
+    assert.equal(r.providerId, 'dp_chat2');
+    assert.equal(r.failover, true);
+    assert.equal(calls.length, 2);
+  } finally { globalThis.fetch = original; }
+});
+
+test('createDecisionRunner：laya 提供方请求体不带 model 字段', async () => {
+  const config = makeConfig({ decisionProviders: [{ id: 'dp_laya2', name: 'L', format: 'laya', endpoint: 'systemone', baseUrl: 'http://127.0.0.1:8000', apiKey: '', modelNames: [], categoryId: '', enabled: true, createdAt: '', updatedAt: '' }] });
+  const calls = [];
+  const original = globalThis.fetch;
+  globalThis.fetch = async (url, init) => {
+    calls.push({ url: String(url), init });
+    return new Response(JSON.stringify({ model: 'x', answers: { model: { type: 'choice', choice: 'ollama:deepseek-r1' } } }), { status: 200, headers: { 'content-type': 'application/json' } });
+  };
+  try {
+    const runner = createDecisionRunner({ getConfig: () => config });
+    const r = await runner.run({ providerIds: ['dp_laya2'], state: 'hi', questions: {} });
+    assert.ok(r);
+    const body = JSON.parse(calls[0].init.body);
+    assert.equal(body.model, undefined, 'laya 提供方不携带 model 字段');
+  } finally { globalThis.fetch = original; }
+});
+
+test('云端 systemone 判定响应（answers 按问题 key 返回）可被解析', () => {
+  // 阿里云 MaaS 实测响应形状：answers 的 key = 判定问题 key（department/escalate/severity）
+  const raw = {
+    model: 'decision-model-preview',
+    request_id: '600ec44e-5889-9214-82b3-e1e468271397',
+    answers: {
+      department: { type: 'choice', choice: 'billing', confidence: 0.88, probabilities: { billing: 0.94, technical: 0.06 } },
+      escalate: { type: 'noul', noul: 0.99 },
+      severity: { type: 'score', score: 2.25, confidence: 0.91 },
+    },
+    usage: { input_tokens: 125 },
+    latency_ms: 61.0,
+  };
+  const values = extractDecisionValues(raw);
+  assert.equal(values.choice, 'billing', 'choice 判定值被提取');
+  assert.equal(values.noul, '0.99', 'noul 判定值被提取');
+  assert.equal(values.score, '2.25', 'score 判定值被提取');
+});
+
+test('插件内置问题（key=model）走云端 systemone：answers.model.choice 命中且不被顶层 model 干扰', () => {
+  // 插件发给云端 systemone 的 questions.key = 'model'，响应 answers.model 携带判定值；
+  // 顶层 model（服务元数据）必须在候选池不匹配时被忽略（防误判未命中）。
+  const raw = {
+    model: 'decision-model-preview',
+    request_id: 'x',
+    answers: {
+      model: { type: 'choice', choice: 'our-free-model:openrouter/free', confidence: 0.88, probabilities: { 'our-free-model:openrouter/free': 0.9 } },
+    },
+    usage: { input_tokens: 125 },
+    latency_ms: 61.0,
+  };
+  const values = extractDecisionValues(raw);
+  const candidates = ['our-free-model:openrouter/free', 'vllm:Qwen3.8-27B-FP8'];
+  const picked = [values.choice, values.model].find((v) => v && candidates.includes(v)) ?? null;
+  assert.equal(picked, 'our-free-model:openrouter/free', '候选池匹配命中判定值，而非顶层服务元数据');
+});
+
+test('attachmentContextHint：按附件类型生成能力提示，无附件为空', () => {
+  assert.equal(attachmentContextHint(), '');
+  assert.equal(attachmentContextHint(['bogus']), '');
+  const hint = attachmentContextHint(['IMAGE', 'video']);
+  assert.ok(hint.includes('附件：图片、视频'), hint);
+  assert.ok(hint.includes('能处理该类输入'), hint);
+  assert.ok(hint.includes('多模态/图片/视频/文件'), hint);
+});
+
+test('enforceAttachmentCapability：附件能力硬校验规则', () => {
+  const config = makeConfig({ modelProfiles: {
+    'our-free-model:nvidia/nemotron-3-ultra-550b-a55b:free': { type: ['推理', '对话', '工具调用'], scene: '' },
+    'vllm:Qwen3.8-27B-FP8': { type: ['本地多模态图片识别对话代码模型'], scene: '' },
+  } });
+  const candidates = ['our-free-model:nvidia/nemotron-3-ultra-550b-a55b:free', 'vllm:Qwen3.8-27B-FP8'];
+  // 无附件 → 不干预
+  assert.equal(enforceAttachmentCapability(candidates[0], candidates, config), null);
+  // 被选模型有能力 → 不干预
+  assert.equal(enforceAttachmentCapability(candidates[1], candidates, config, ['image']), null);
+  // 被选无能力且池内有 → 改选能力模型
+  assert.equal(enforceAttachmentCapability(candidates[0], candidates, config, ['image']), 'vllm:Qwen3.8-27B-FP8');
+  // 池内无能力模型 → 保持原决策
+  assert.equal(enforceAttachmentCapability(candidates[0], [candidates[0]], config, ['image']), null);
+  // 画像类型串命中关键词
+  assert.equal(hasAttachmentCapability('本地多模态图片识别对话代码模型'), true);
+  assert.equal(hasAttachmentCapability('推理、对话、工具调用'), false);
+  assert.equal(hasAttachmentCapability('音频、语音识别'), true);
+  assert.equal(hasAttachmentCapability('文件处理、文档解析'), true);
+});
+
+test('resolveTargetModelFromPool：附件消息被决策到无能力模型时强制改选（attachment-override）', async () => {
+  const config = makeConfig({
+    roles: [{
+      id: 'role_ops', name: '运维员', deptIds: ['dept_it'],
+      categoryBindings: [{ categoryId: 'cat_ops', modelIds: ['our-free-model:nvidia/nemotron-3-ultra-550b-a55b:free', 'vllm:Qwen3.8-27B-FP8'] }], desc: '',
+    }],
+    modelProfiles: {
+      'our-free-model:nvidia/nemotron-3-ultra-550b-a55b:free': { type: ['推理', '对话', '工具调用'], scene: '' },
+      'vllm:Qwen3.8-27B-FP8': { type: ['本地多模态图片识别对话代码模型'], scene: '' },
+    },
+  });
+  const decides = [];
+  const decide = async (state, questions) => {
+    decides.push(1);
+    return { answers: { model: { type: 'choice', choice: 'our-free-model:nvidia/nemotron-3-ultra-550b-a55b:free' } } };
+  };
+  const pool = collectUserModelPool(config, 'staff_001');
+  const outcome = await resolveTargetModelFromPool(pool, depsFor(config, decide), config.route.imRoute, 'staff_001', '', ['image']);
+  assert.equal(outcome.attachmentOverride, true, '附件能力硬校验触发');
+  assert.equal(outcome.model, 'vllm:Qwen3.8-27B-FP8', '强制改选带视觉能力的模型');
+  assert.equal(decides.length, 1, '仍只决策一次，校验在决策后兜底校正');
+});
+
+test('resolveTargetModelFromPool：带附件时判定问题携带附件能力提示', async () => {
+  const config = makeConfig();
+  const seen = [];
+  const decide = async (state, questions) => {
+    seen.push({ state, questions });
+    return { model: { response: { type: 'choice', choice: 'ollama:deepseek-r1' } } };
+  };
+  const pool = collectUserModelPool(config, 'staff_001');
+  const outcome = await resolveTargetModelFromPool(pool, depsFor(config, decide), config.route.imRoute, 'staff_001', '看看这个', ['image', 'video']);
+  assert.equal(outcome.model, 'ollama:deepseek-r1');
+  assert.equal(seen.length, 1);
+  assert.ok(seen[0].questions.model.instructions.includes('本条消息包含附件：图片、视频'), '判定指令带上附件能力提示');
+  assert.ok(seen[0].questions.model.instructions.includes('能处理该类输入'));
 });

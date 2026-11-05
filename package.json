@@ -1,6 +1,6 @@
 {
   "name": "dsh-mrrp",
-  "version": "2026.11.04",
+  "version": "2026.11.05",
   "description": "MRRP 控制台：DSH 模型路由与管理插件。管理模型分类、路由模型配置、角色/部门与用户，让不同角色/部门的请求路由到指定分类下的模型。",
   "keywords": [
     "deepseek-harness",

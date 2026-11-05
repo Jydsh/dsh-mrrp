@@ -54,8 +54,10 @@ export interface ImRouteQuestion {
 export interface ImRouteConfig {
   /** 启用 IM 消息路由（订阅 DSH 会话事件，按消息发送者路由会话模型） */
   enabled: boolean;
-  /** 任务判定用的决策模型提供方 id（decisionProviders 之一，当前仅支持 format=laya） */
+  /** 任务判定用的决策模型提供方 id（decisionProviders 之一；支持 laya 与 OpenAI 兼容判定型服务） */
   decisionProviderId: string;
+  /** 决策模型提供方有序列表（负载均衡轮询 + 故障转移按序换用；空时回退 [decisionProviderId]） */
+  decisionProviderIds: string[];
   /** 判定问题定义（决策模型 questions，多字段） */
   questions: Record<string, ImRouteQuestion>;
   /** 判定规则：决策输出字段值 -> 模型分类（多字段判定 + 映射表） */
@@ -139,7 +141,8 @@ export interface SidebarConfig {
 export type DecisionFormat = 'laya' | 'openai' | 'generic';
 
 /** Laya 调用端点：systemone = 本地 laya-server（POST /v1/systemone）；decisions = 0G 云端（POST /v1/decisions，自动带 model: laya）。 */
-export type LayaEndpoint = 'systemone' | 'decisions';
+/** 决策调用端点：systemone/decisions 为判定协议（云端判定型服务），chat 为 OpenAI 兼容对话判定（普通大模型当判定器）。 */
+export type LayaEndpoint = 'systemone' | 'decisions' | 'chat';
 
 /** 决策模型提供方（laya-server 本地部署 / 0G 云端 / OpenAI 兼容 / 通用 API）。 */
 export interface DecisionProvider {
@@ -148,7 +151,7 @@ export interface DecisionProvider {
   name: string;
   /** 接口格式 */
   format: DecisionFormat;
-  /** Laya 调用端点（仅 format=laya 生效） */
+  /** 决策调用端点：systemone/decisions=判定协议（laya 本地 / 0G 云端 / 云端判定型服务）；chat=OpenAI 兼容对话判定（普通大模型当判定器） */
   endpoint: LayaEndpoint;
   /** API 基地址，如 http://127.0.0.1:8000（本地）或 https://router-api.0g.ai（云端） */
   baseUrl: string;
@@ -235,6 +238,7 @@ export const DEFAULT_CONFIG: Readonly<PluginConfig> = Object.freeze({
     imRoute: Object.freeze({
       enabled: false,
       decisionProviderId: '',
+      decisionProviderIds: Object.freeze([]),
       questions: Object.freeze({}),
       rules: Object.freeze([]),
       fallbackModel: '',
@@ -374,6 +378,7 @@ export function sanitizeImRoute(input: unknown): ImRouteConfig {
   return {
     enabled: cleanBool(source.enabled, fallback.enabled),
     decisionProviderId: cleanString(source.decisionProviderId, '', 40),
+    decisionProviderIds: cleanStringArray(source.decisionProviderIds).slice(0, 8),
     questions: sanitizeImRouteQuestions(source.questions),
     rules: sanitizeImRouteRules(source),
     fallbackModel: cleanString(source.fallbackModel, '', 128),
@@ -465,7 +470,11 @@ export function sanitizeUser(input: unknown): User {
 export function sanitizeDecisionProvider(input: unknown): DecisionProvider {
   const source = (input && typeof input === 'object' ? input : {}) as Record<string, any>;
   const format = ['laya', 'openai', 'generic'].includes(source.format) ? source.format : 'laya';
-  const endpoint = source.endpoint === 'decisions' ? 'decisions' : 'systemone';
+  // 端点：laya 默认判定协议 systemone；openai/generic 无判定端点时默认走 OpenAI 兼容对话判定（chat）
+  const validEndpoints = ['systemone', 'decisions', 'chat'];
+  const endpoint = validEndpoints.includes(source.endpoint)
+    ? source.endpoint
+    : (format === 'laya' ? 'systemone' : 'chat');
   return {
     id: cleanId(source.id, 'dp'),
     name: cleanString(source.name, '未命名提供方', 60),
