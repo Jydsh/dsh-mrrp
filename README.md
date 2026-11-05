@@ -4,7 +4,7 @@ MRRP（Model Routing & Resource Planning）控制台：DSH 的模型路由与管
 
 管理**模型分类**、**路由配置**、**决策模型配置**、**角色 / 部门** 与 **用户**，让不同角色 / 部门的请求路由到指定分类下的模型。
 
-- 版本：2026.11.04
+- 版本：2026.11.05
 - 兼容：DSH 0.2.1-rc.2（profiles: web / desktop）
 - 协议：TS 优先，client 侧混合 JS（零 JSX，`__ModuleLoader__.load` + 手写 `h()`）
 
@@ -31,13 +31,13 @@ MRRP（Model Routing & Resource Planning）控制台：DSH 的模型路由与管
 ### 桌面版
 
 ```bash
-dsh plugin --profile desktop add ./dsh-mrrp-2026.11.04.tgz
+dsh plugin --profile desktop add ./dsh-mrrp-2026.11.05.tgz
 ```
 
 ### Web 版
 
 ```bash
-dsh plugin --profile web add ./dsh-mrrp-2026.11.04.tgz
+dsh plugin --profile web add ./dsh-mrrp-2026.11.05.tgz
 ```
 
 > `dsh plugin` 必须显式指定 `--profile`（DSH 的插件管理命令，转发给对应 profile 的 pnpm）。安装后**重启 DSH**（桌面版重启桌面端、Web 版重启 Web 端）插件即生效。
@@ -233,7 +233,7 @@ curl "https://router-api.0g.ai/v1/decisions" \
 
 ### cordis.patch.yml 配置片段
 
-安装方式（`dsh plugin add ./dsh-mrrp-2026.11.04.tgz`）会自动写入 `cordis.patch.yml` 的 `insert: [{ id: dsh-mrrp }]`。如需用配置文件直接声明 Laya 服务（未在控制台新增提供方时的兜底），在插件的 `config` 下追加：
+安装方式（`dsh plugin add ./dsh-mrrp-2026.11.05.tgz`）会自动写入 `cordis.patch.yml` 的 `insert: [{ id: dsh-mrrp }]`。如需用配置文件直接声明 Laya 服务（未在控制台新增提供方时的兜底），在插件的 `config` 下追加：
 
 ```yaml
 # DSH 配置目录下（如 ~/.dsh/profiles/desktop/cordis.patch.yml）
