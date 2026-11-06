@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
+import { mkdirSync, unlinkSync, writeFileSync } from 'node:fs';
 import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
-import { dirname, resolve } from 'node:path';
+import { dirname, isAbsolute, join, normalize, resolve } from 'node:path';
 import { mrrpConfigPathFor } from './profile.js';
 const MAX_STR = 200;
 const MAX_DESC = 500;
@@ -64,7 +65,45 @@ export const DEFAULT_CONFIG = Object.freeze({
     modelProfiles: {},
     typeSceneList: DEFAULT_TYPE_SCENES.slice(),
     logRetentionDays: 30,
+    logDir: '',
 });
+/**
+ * 日志目录清洗：空串 = 默认（与 config.json 同目录）。
+ * 只接受绝对路径（Windows 盘符 / UNC / POSIX 绝对路径），超长或含空字节的一律回退默认。
+ * 尾部多余分隔符去掉，盘符根（C:\、/）原样保留。
+ */
+export function sanitizeLogDir(value) {
+    if (typeof value !== 'string')
+        return '';
+    const text = value.trim();
+    if (!text || text.length > 512 || text.includes('\0'))
+        return '';
+    if (!isAbsolute(text))
+        return '';
+    const normalized = normalize(text);
+    if (/^[A-Za-z]:[\\/]$/.test(normalized) || normalized === '/')
+        return normalized;
+    const stripped = normalized.replace(/[\\/]+$/, '');
+    return stripped || normalized;
+}
+/** 当前生效的日志目录：配置了合法绝对目录就用它，否则回退 config.json 所在目录。 */
+export function resolveRouteLogDir(configPath, custom) {
+    return sanitizeLogDir(custom) || dirname(configPath);
+}
+/** 校验日志目录可用：不存在则递归创建，并写一个探针文件确认真的可写。
+ *  返回失败原因（空串 = 可用）。目录不可写时必须先拦住，否则日志会静默写不进去。 */
+export function probeLogDir(dir) {
+    try {
+        mkdirSync(dir, { recursive: true });
+        const probe = join(dir, `.mrrp-write-probe-${process.pid}-${Date.now()}`);
+        writeFileSync(probe, 'ok', 'utf8');
+        unlinkSync(probe);
+        return '';
+    }
+    catch (error) {
+        return error?.message ?? String(error);
+    }
+}
 function cleanString(value, fallback, max = MAX_STR) {
     if (typeof value !== 'string')
         return fallback;
@@ -376,6 +415,7 @@ export function sanitizeConfig(input) {
         modelProfiles: sanitizeModelProfiles(source.modelProfiles),
         typeSceneList: sanitizeTypeSceneList(source.typeSceneList),
         logRetentionDays: cleanInt(source.logRetentionDays, 30, 1, 365),
+        logDir: sanitizeLogDir(source.logDir),
     };
 }
 /** 清洗模型画像表（key=provider:model，type/scene 任一非空才保留；上限 200 条）。

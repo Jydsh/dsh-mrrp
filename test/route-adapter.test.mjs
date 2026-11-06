@@ -361,6 +361,18 @@ test('adapter：listModels/resolveModel 声明全模态输入与输出（图片/
   assert.deepEqual(m.outputModalities, ['text', 'image', 'video', 'audio', 'file']);
 });
 
+test('adapter：启动决策模型关闭时不再暴露虚拟模型（模型列表里不该残留「MRRP 智能路由」）', async () => {
+  const config = makeConfig();
+  config.route.imRoute = { ...config.route.imRoute, enabled: false };
+  const { deps } = adapterDeps(config, {});
+  const adapter = createRouteAdapter(deps);
+  const models = await adapter.listModels(ROUTE_PROVIDER);
+  assert.deepEqual(models, []);
+  // 关闭后仍可解析：旧会话已选中 mrrp/route 时按兜底模型转发，不能因为隐藏列表而崩
+  const resolved = await adapter.resolveModel(ROUTE_PROVIDER, ROUTE_MODEL);
+  assert.equal(resolved.id, ROUTE_MODEL);
+});
+
 test('adapter.stream：目标模型输出图片/视频块经路由原样透传（forward-media 观测）', async () => {
   const config = makeConfig();
   const decide = async () => ({ model: { response: { type: 'choice', choice: 'ollama:deepseek-r1' } } });
@@ -517,6 +529,56 @@ test('容灾：首选模型连不上（且未输出内容）时自动切候选�
   assert.ok(events.includes('"event":"attempt-fail"'), '记录失败模型');
   assert.ok(events.includes('"event":"failover-switch"'), '记录切换');
   assert.ok(events.includes('"event":"failover-recovered"'), '记录容灾生效');
+});
+
+test('容灾：目标模型以 finish(kind=error) 表达限流/额度不足时也自动切兜底（宿主不抛异常的真实形态）', async () => {
+  const config = makeConfig();
+  const logs = [];
+  const called = [];
+  const streamImpl = async function* (opts) {
+    called.push(`${opts.provider}:${opts.model}`);
+    if (opts.model === 'qwen-turbo') {
+      // 宿主把 provider 的 429 归一化成终态 finish 事件，而不是抛异常
+      yield { type: 'finish', reason: { kind: 'error', failure: { message: 'Rate limit exceeded', code: 'RATE_LIMITED', status: 429 } } };
+      return;
+    }
+    yield { type: 'text-delta', index: 0, text: '来自兜底模型的回复' };
+    yield { type: 'finish', reason: { kind: 'stop' } };
+  };
+  const decide = async () => ({ model: { response: { type: 'choice', choice: 'dashscope:qwen-turbo' } } });
+  const { deps } = adapterDeps(config, { decide, logs, streamImpl });
+  const adapter = createRouteAdapter(deps);
+
+  const { chunks, error } = await runStream(adapter);
+
+  assert.equal(error, null, '限流不应被当成正常结束抛给用户');
+  const text = chunks.filter((c) => typeof c.text === 'string').map((c) => c.text).join('');
+  assert.equal(text, '来自兜底模型的回复');
+  assert.deepEqual(called, ['dashscope:qwen-turbo', 'ollama:deepseek-r1'], '限流后切到下一个模型');
+  const events = logs.join('\n');
+  assert.ok(events.includes('"event":"model-failure"'), '记录 finish 事件里的限流错误');
+  assert.ok(events.includes('"code":"RATE_LIMITED"'), '记录错误码');
+  assert.ok(events.includes('"event":"failover-switch"'), '记录切换');
+  assert.ok(events.includes('"event":"failover-recovered"'), '记录容灾生效');
+});
+
+test('容灾：finish(kind=aborted)（用户主动停止）不当作失败、不切换', async () => {
+  const config = makeConfig();
+  const logs = [];
+  const called = [];
+  const streamImpl = async function* (opts) {
+    called.push(`${opts.provider}:${opts.model}`);
+    yield { type: 'text-delta', index: 0, text: '被打断的内容' };
+    yield { type: 'finish', reason: { kind: 'aborted', failure: { message: 'aborted by user', code: 'ABORTED' } } };
+  };
+  const decide = async () => ({ model: { response: { type: 'choice', choice: 'dashscope:qwen-turbo' } } });
+  const { deps } = adapterDeps(config, { decide, logs, streamImpl });
+  const adapter = createRouteAdapter(deps);
+
+  const { error } = await runStream(adapter);
+  assert.equal(error, null, '用户主动停止不算失败');
+  assert.deepEqual(called, ['dashscope:qwen-turbo'], '不再换模型');
+  assert.ok(!logs.join('\n').includes('"event":"failover-switch"'), '不记录切换');
 });
 
 test('容灾：候选与兜底全部不可用时抛出汇总错误，不去给用户一个含糊的「暂时无法连接」', async () => {

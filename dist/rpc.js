@@ -1,6 +1,7 @@
 import { readFileSync, readdirSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
-import { defaultRoleIdFor, sanitizeCategory, sanitizeConfig, sanitizeDecisionProvider, sanitizeDept, sanitizeRole, sanitizeTypeSceneList, sanitizeUser } from './store.js';
+import { execFile } from 'node:child_process';
+import { dirname, join } from 'node:path';
+import { defaultRoleIdFor, probeLogDir, resolveRouteLogDir, sanitizeCategory, sanitizeConfig, sanitizeDecisionProvider, sanitizeDept, sanitizeLogDir, sanitizeRole, sanitizeTypeSceneList, sanitizeUser } from './store.js';
 import { discoverModels, listProviders } from './models.js';
 import { fetchProviderModels, testProvider } from './decision.js';
 import { noopImReader } from './dshim.js';
@@ -423,11 +424,127 @@ export function installRpc(ctx, deps) {
             },
         };
     }
+    /** 当前生效的日志目录：控制台可改存放路径，所以每次调用现取；旧注入的静态 logDir 仍兼容。 */
+    function logDirNow() {
+        try {
+            const dynamic = deps.getLogDir?.();
+            if (typeof dynamic === 'string' && dynamic)
+                return dynamic;
+        }
+        catch { /* 取目录失败回退静态值 */ }
+        return deps.logDir ?? '';
+    }
+    /** 默认日志目录：config.json 所在目录（用户未自定义时的落点，也是「恢复默认」的目标）。 */
+    function defaultLogDirNow() {
+        return dirname(store.path);
+    }
+    let dirPick = null;
+    async function pickDirViaElectron(defaultPath) {
+        try {
+            // 用变量传模块名，避免 TS 在编译期去解析 electron 的类型（插件本身不依赖 electron）
+            const electronModule = 'electron';
+            const mod = (await import(/* @vite-ignore */ electronModule));
+            const dialog = mod?.dialog ?? mod?.default?.dialog;
+            if (typeof dialog?.showOpenDialog !== 'function')
+                return null;
+            const result = await dialog.showOpenDialog({
+                title: '选择日志存放目录',
+                defaultPath: defaultPath || undefined,
+                properties: ['openDirectory', 'createDirectory'],
+                buttonLabel: '选这个目录',
+            });
+            if (!result || result.canceled)
+                return { canceled: true };
+            const chosen = Array.isArray(result.filePaths) ? result.filePaths[0] : '';
+            return chosen ? { path: chosen } : { canceled: true };
+        }
+        catch {
+            return null; // 不在 Electron 里 / 加载失败 → 交给平台回退
+        }
+    }
+    function pickDirViaPowerShell(defaultPath) {
+        if (process.platform !== 'win32')
+            return Promise.resolve(null);
+        const seed = defaultPath.replace(/'/g, "''");
+        const script = [
+            'Add-Type -AssemblyName System.Windows.Forms | Out-Null',
+            '$dlg = New-Object System.Windows.Forms.FolderBrowserDialog',
+            "$dlg.Description = '选择日志存放目录'",
+            '$dlg.ShowNewFolderButton = $true',
+            seed ? `$dlg.SelectedPath = '${seed}'` : '',
+            'if ($dlg.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($dlg.SelectedPath) }',
+        ].filter(Boolean).join('; ');
+        return new Promise((resolve) => {
+            execFile('powershell.exe', ['-NoProfile', '-STA', '-Command', script], { timeout: 240_000, windowsHide: true }, (error, stdout) => {
+                if (error) {
+                    resolve(null);
+                    return;
+                } // 弹不出来（无桌面会话等）→ 视为不支持
+                const chosen = String(stdout || '').trim();
+                resolve(chosen ? { path: chosen } : { canceled: true });
+            });
+        });
+    }
+    const DIR_PICK_TIMEOUT_MS = 5 * 60 * 1000;
+    /** 启动一次目录选择：立刻返回 id；对话框在后台弹，结果用 logs.dir.pick.poll 取。 */
+    function logsDirPickStart(payload) {
+        if (dirPick && dirPick.state === 'pending' && Date.now() - dirPick.startedAt < DIR_PICK_TIMEOUT_MS) {
+            return { id: dirPick.id, state: dirPick.state }; // 已有对话框在等 → 复用，避免弹两个
+        }
+        const seed = (typeof payload?.defaultDir === 'string' ? sanitizeLogDir(payload.defaultDir) : '') || logDirNow() || defaultLogDirNow();
+        const id = `pick-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+        // 无桌面会话 / 无人值守部署可以用 MRRP_DISABLE_NATIVE_PICK=1 关掉原生弹窗，避免弹出的窗口挂着不走。
+        if (process.env.MRRP_DISABLE_NATIVE_PICK === '1') {
+            dirPick = {
+                id, state: 'unsupported', path: '', startedAt: Date.now(),
+                message: '当前环境已关闭系统文件夹选择框（MRRP_DISABLE_NATIVE_PICK=1），请直接在输入框填写绝对路径。',
+            };
+            return { id, state: 'unsupported' };
+        }
+        const record = { id, state: 'pending', path: '', message: '', startedAt: Date.now() };
+        dirPick = record;
+        void (async () => {
+            const viaElectron = await pickDirViaElectron(seed);
+            const result = viaElectron === null ? await pickDirViaPowerShell(seed) : viaElectron;
+            if (!dirPick || dirPick.id !== id)
+                return; // 被更新的请求覆盖
+            if (result === null) {
+                dirPick.state = 'unsupported';
+                dirPick.message = '当前环境打不开系统文件夹选择框，请直接在输入框填写绝对路径（例如 D:\\dsh-logs）。';
+                return;
+            }
+            if (result.path) {
+                dirPick.state = 'done';
+                dirPick.path = result.path;
+                return;
+            }
+            dirPick.state = 'canceled';
+        })().catch((error) => {
+            if (dirPick && dirPick.id === id) {
+                dirPick.state = 'error';
+                dirPick.message = error instanceof Error ? error.message : String(error);
+            }
+        });
+        return { id, state: 'pending' };
+    }
+    /** 轮询目录选择结果。 */
+    function logsDirPickPoll(payload) {
+        const id = typeof payload?.id === 'string' ? payload.id : '';
+        if (!dirPick || (id && dirPick.id !== id)) {
+            return { state: 'expired', path: '', message: '这次选择已经结束，请重新点击「浏览…」。' };
+        }
+        if (dirPick.state === 'pending' && Date.now() - dirPick.startedAt > DIR_PICK_TIMEOUT_MS) {
+            dirPick.state = 'error';
+            dirPick.message = '等待选择超时，请重新点击「浏览…」或手动填写路径。';
+        }
+        return { state: dirPick.state, path: dirPick.path, message: dirPick.message };
+    }
     /** 读取当天路由决策日志（route-decision-YYYY-MM-DD.log，append JSON 行），返回最新在前、最多 limit 条。 */
     function logsRead(payload) {
         const want = typeof payload?.limit === 'number' && Number.isFinite(payload.limit) ? Math.floor(payload.limit) : 200;
         const cap = Math.max(1, Math.min(want, 1000));
-        const path = deps.logDir ? routeLogPathFor(deps.logDir) : '';
+        const dir = logDirNow();
+        const path = dir ? routeLogPathFor(dir) : '';
         if (!path)
             return { logs: [], path };
         let text = '';
@@ -451,10 +568,12 @@ export function installRpc(ctx, deps) {
         rows.reverse(); // 最新在前
         return { logs: rows, path };
     }
-    /** 日志设置读取：保留天数（logRetentionDays）+ 当天日志文件路径 / 大小 / 行数 / 历史文件数。 */
+    /** 日志设置读取：保留天数 + 存放目录（配置值 / 生效值 / 默认值）+ 当天日志文件路径 / 大小 / 行数 / 历史文件数。 */
     function logsSettingsGet() {
         const retentionDays = store.get().logRetentionDays || 30;
-        const dir = deps.logDir ?? '';
+        const custom = sanitizeLogDir(store.get().logDir);
+        const dir = logDirNow();
+        const defaultDir = defaultLogDirNow();
         const path = dir ? routeLogPathFor(dir) : '';
         let bytes = 0;
         let lineCount = 0;
@@ -473,20 +592,57 @@ export function installRpc(ctx, deps) {
             }
             catch { /* 目录不可读：视为 0 */ }
         }
-        return { retentionDays, path, bytes, lineCount, files };
+        let dirExists = false;
+        if (dir) {
+            try {
+                dirExists = statSync(dir).isDirectory();
+            }
+            catch {
+                dirExists = false;
+            }
+        }
+        return {
+            retentionDays, path, bytes, lineCount, files,
+            logDir: custom, resolvedDir: dir, defaultDir, isCustom: Boolean(custom), dirExists,
+        };
     }
-    /** 日志设置保存：更新自动清理保留天数（1~365，取整）。 */
+    /** 日志设置保存：自动清理保留天数（1~365）+ 日志存放目录。
+     *  目录只接受绝对路径；空串 = 恢复默认（config.json 所在目录）。
+     *  保存前会真实创建目录并写一次探针文件，写不进去就直接报错，避免「设置成功但日志静默丢失」。 */
     async function logsSettingsSet(payload) {
-        const raw = Number(payload?.retentionDays);
-        const days = Number.isFinite(raw) ? Math.min(365, Math.max(1, Math.round(raw))) : 30;
         const config = store.get();
-        const saved = await store.save({ ...config, logRetentionDays: days });
-        return { retentionDays: saved.logRetentionDays || 30 };
+        const patch = {};
+        if (payload?.retentionDays !== undefined) {
+            const raw = Number(payload.retentionDays);
+            patch.logRetentionDays = Number.isFinite(raw) ? Math.min(365, Math.max(1, Math.round(raw))) : 30;
+        }
+        if (payload?.logDir !== undefined) {
+            const raw = typeof payload.logDir === 'string' ? payload.logDir.trim() : '';
+            const next = sanitizeLogDir(raw);
+            if (raw && !next) {
+                throw Object.assign(new Error('日志目录必须是绝对路径（例如 D:\\dsh-logs 或 /var/log/mrrp），留空则使用默认目录。'), { code: 'bad-log-dir' });
+            }
+            if (next) {
+                const bad = probeLogDir(next);
+                if (bad)
+                    throw Object.assign(new Error(`该目录无法创建或写入：${bad}`), { code: 'log-dir-not-writable' });
+            }
+            patch.logDir = next;
+        }
+        const saved = await store.save({ ...config, ...patch });
+        const custom = sanitizeLogDir(saved.logDir);
+        return {
+            retentionDays: saved.logRetentionDays || 30,
+            logDir: custom,
+            resolvedDir: resolveRouteLogDir(store.path, custom),
+            defaultDir: defaultLogDirNow(),
+            isCustom: Boolean(custom),
+        };
     }
     /** 清空全部路由决策日志：删除目录下所有按天日志文件（route-decision-YYYY-MM-DD.log）与旧版 route-decision.log，
      *  返回删除的行数与文件数。 */
     function logsClear() {
-        const dir = deps.logDir ?? '';
+        const dir = logDirNow();
         if (!dir)
             return { removed: 0, files: 0, path: '' };
         let names = [];
@@ -519,7 +675,7 @@ export function installRpc(ctx, deps) {
     }
     /** 列出全部路由决策日志文件（当天 + 历史 route-decision*.log）：名称 / 路径 / 大小 / 条数 / 修改时间。 */
     function logsFilesList() {
-        const dir = deps.logDir ?? '';
+        const dir = logDirNow();
         if (!dir)
             return { files: [] };
         let names = [];
@@ -553,7 +709,7 @@ export function installRpc(ctx, deps) {
      *  返回 rows: [{ raw: 原始行文本, data: 解析后的 JSON 对象（坏行 data 为 null）}]，raw 可用于按行删除。 */
     function logsFileRead(payload) {
         const name = logsFileNameOf(payload);
-        const dir = deps.logDir ?? '';
+        const dir = logDirNow();
         if (!name || !dir)
             return { name, path: '', rows: [], total: 0 };
         const full = join(dir, name);
@@ -583,7 +739,7 @@ export function installRpc(ctx, deps) {
     /** 按原始行文本删除指定日志文件中的记录（勾选删除），返回删除行数。 */
     function logsFileDropRows(payload) {
         const name = logsFileNameOf(payload);
-        const dir = deps.logDir ?? '';
+        const dir = logDirNow();
         if (!name || !dir)
             return { name, removed: 0 };
         const raws = Array.isArray(payload?.raws) ? payload.raws.filter((s) => typeof s === 'string' && s.trim()) : [];
@@ -622,7 +778,7 @@ export function installRpc(ctx, deps) {
     /** 删除指定日志文件（整文件），返回删除的行数。 */
     function logsFileClear(payload) {
         const name = logsFileNameOf(payload);
-        const dir = deps.logDir ?? '';
+        const dir = logDirNow();
         if (!name || !dir)
             return { name, removed: 0 };
         const full = join(dir, name);
@@ -641,7 +797,7 @@ export function installRpc(ctx, deps) {
      *  keepKeyword：只保留 message/detail 含该关键词的行。返回删除行数。 */
     function logsFilePrune(payload) {
         const name = logsFileNameOf(payload);
-        const dir = deps.logDir ?? '';
+        const dir = logDirNow();
         if (!name || !dir)
             return { name, removed: 0 };
         const full = join(dir, name);
@@ -827,6 +983,10 @@ export function installRpc(ctx, deps) {
             return logsSettingsGet();
         if (method === 'logs.settings.set')
             return logsSettingsSet(payload);
+        if (method === 'logs.dir.pick.start')
+            return logsDirPickStart(payload);
+        if (method === 'logs.dir.pick.poll')
+            return logsDirPickPoll(payload);
         if (method === 'logs.clear')
             return logsClear();
         if (method === 'logs.files.list')

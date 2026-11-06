@@ -1,7 +1,7 @@
-import { appendFileSync } from 'node:fs';
+import { appendFileSync, statSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { installRpc, type DshCtx } from './rpc.js';
-import { MrrpConfigStore } from './store.js';
+import { MrrpConfigStore, probeLogDir, resolveRouteLogDir, sanitizeLogDir } from './store.js';
 import { makeLayaDecide } from './decision.js';
 import { makeImReader } from './dshim.js';
 import { createImRouting, pruneRouteLogDir, pruneRouteLogFile, routeLogPathFor } from './route-engine.js';
@@ -67,8 +67,9 @@ function makeLogger(ctx: DshContext): DshLogger {
 }
 
 /** 路由诊断日志器：写当天按天日志文件（route-decision-YYYY-MM-DD.log，append JSON 行）并透传宿主 logger。
- *  供会话发送者观测（im-route）使用，与 adapter 的路由决策日志共用同一文件（按天分文件）。 */
-function makeRouteLogger(logDir: string, host: DshLogger): DshLogger {
+ *  供会话发送者观测（im-route）使用，与 adapter 的路由决策日志共用同一文件（按天分文件）。
+ *  目录用函数现取：控制台「日志设置」改了存放路径后，后续写入立即落到新目录。 */
+function makeRouteLogger(getLogDir: () => string, host: DshLogger): DshLogger {
   const emit = (level: string, args: unknown[]): void => {
     let message = '';
     for (const arg of args) {
@@ -76,7 +77,7 @@ function makeRouteLogger(logDir: string, host: DshLogger): DshLogger {
         + (typeof arg === 'string' ? arg : safeJson(arg));
     }
     const line = JSON.stringify({ ts: new Date().toISOString(), scope: 'im-route', level, message });
-    try { appendFileSync(routeLogPathFor(logDir), `${line}\n`, 'utf8'); } catch { /* 写失败不阻塞主链路 */ }
+    try { appendFileSync(routeLogPathFor(getLogDir()), `${line}\n`, 'utf8'); } catch { /* 写失败不阻塞主链路 */ }
     try { (host as unknown as Record<string, (...args: unknown[]) => void>)?.[level]?.(`[dsh-mrrp:im-route]`, ...args); } catch { /* ignore */ }
   };
   return {
@@ -100,24 +101,47 @@ export async function apply(ctx: DshContext, config: ApplyConfig = {}): Promise<
   const configFile = explicitPath || mrrpConfigPathFor(identity);
   if (!explicitPath) ensureProfileConfig(identity, configFile);
   const store = new MrrpConfigStore(configFile);
-  // 路由决策日志目录：与 config.json 同目录，按天分文件（route-decision-YYYY-MM-DD.log，append JSON 行）
-  const routeLogDir = dirname(store.path);
+  // 路由决策日志目录：默认与 config.json 同目录；控制台「日志设置」可改成任意绝对路径。
+  // 所有写入 / 读取 / 清理都通过 getLogDir() 现取，改完路径无需重装插件。
+  // 自定义目录不存在（如刚改了配置还没建目录）或启动探测不可写时，本次运行回退默认目录，保证日志不会静默丢失。
+  let brokenLogDir = '';
+  const getLogDir = (): string => {
+    const dir = resolveRouteLogDir(store.path, store.get().logDir);
+    const fallback = dirname(store.path);
+    if (dir === fallback) return dir;
+    if (brokenLogDir && dir === brokenLogDir) return fallback;
+    try { return statSync(dir).isDirectory() ? dir : fallback; } catch { return fallback; }
+  };
   logger.info?.(
     '[dsh-mrrp] 当前 profile：',
     identity.profile ?? '未识别',
     `（依据：${identity.source}${identity.candidates.length ? `，候选：${identity.candidates.join('/')}` : ''}）`,
     '配置：',
     store.path,
+    '日志目录：',
+    getLogDir(),
   );
   // 会话发送者观测日志：写当天日志文件（与 adapter 共用），宿主 logger 透传。
-  const routeLogger = makeRouteLogger(routeLogDir, logger);
+  const routeLogger = makeRouteLogger(getLogDir, logger);
   try {
     await store.load();
+    // 启动时校验一次自定义日志目录：不可写就本次运行回退默认目录并明确报出来（否则日志会静默写不进去）
+    try {
+      const custom = sanitizeLogDir(store.get().logDir);
+      if (custom) {
+        const bad = probeLogDir(custom);
+        if (bad) {
+          brokenLogDir = custom;
+          logger.warn?.(`[dsh-mrrp] 日志目录不可用（${custom}）：${bad}；本次运行回退到 ${dirname(store.path)}，可在控制台「日志设置」里换一个目录`);
+        }
+      }
+    } catch { /* ignore */ }
     // 启动时清理一次路由决策日志（删除超过保留天数的历史按天文件 + 当天文件内过期行；失败静默不影响启动）
     try {
       const retention = store.get().logRetentionDays || 30;
-      pruneRouteLogDir(routeLogDir, retention);
-      pruneRouteLogFile(routeLogPathFor(routeLogDir), retention);
+      const dir = getLogDir();
+      pruneRouteLogDir(dir, retention);
+      pruneRouteLogFile(routeLogPathFor(dir), retention);
     } catch { /* ignore */ }
   } catch (error) {
     logger.error?.('[dsh-mrrp] failed to load config, using defaults:', (error as Error)?.message ?? error);
@@ -153,8 +177,8 @@ export async function apply(ctx: DshContext, config: ApplyConfig = {}): Promise<
         registry: imRouting,
         host: { llm, logger },
         logger,
-        // 路由决策日志：与 config.json 同目录，按天分文件（append JSON 行）
-        logDir: routeLogDir,
+        // 路由决策日志：按天分文件（append JSON 行）；目录现取，改路径后即时生效
+        getLogDir,
       });
       adapterRegistration = llm.registerAdapter(['mrrp'], adapter);
       logger.info?.('[dsh-mrrp] 决策模型路由 adapter 已注册：对话模型列表可选中「MRRP 智能路由」');
@@ -168,7 +192,7 @@ export async function apply(ctx: DshContext, config: ApplyConfig = {}): Promise<
   const rpc = installRpc(ctx, {
     store, llm, logger, im,
     imRoutingStatus: () => imRouting.status(),
-    logDir: routeLogDir,
+    getLogDir,
     updater: {
       current: getCurrentVersion,
       check: checkLatestVersion,

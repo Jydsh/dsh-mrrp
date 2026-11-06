@@ -63,6 +63,11 @@ export interface RouteAdapterDeps {
    * 不配置时仅走 logger（宿主日志）。
    */
   logDir?: string;
+  /**
+   * 动态取日志目录（优先于 logDir）：控制台「日志设置」里改了存放路径后，
+   * 后续写入即时落到新目录，不需要重启或重装插件。
+   */
+  getLogDir?: () => string;
 }
 
 function isRecord(value: unknown): value is Record<string, any> {
@@ -73,15 +78,25 @@ function warn(deps: RouteAdapterDeps, message: string, ...args: unknown[]): void
   try { deps.logger?.warn?.(`[dsh-mrrp:route-adapter] ${message}`, ...args); } catch { /* ignore */ }
 }
 
+/** 当前生效的日志目录：优先动态取值（控制台可改），回退静态注入的 logDir。 */
+function logDirOf(deps: RouteAdapterDeps): string {
+  try {
+    const dynamic = deps.getLogDir?.();
+    if (typeof dynamic === 'string' && dynamic) return dynamic;
+  } catch { /* 取目录失败则回退静态值 */ }
+  return typeof deps.logDir === 'string' ? deps.logDir : '';
+}
+
 /** 路由决策日志：追加 JSON 行到当天按天日志文件（若配置），同时透传宿主 logger.info。 */
 function routeLog(deps: RouteAdapterDeps, entry: Record<string, unknown>): void {
   const line = JSON.stringify({ ts: new Date().toISOString(), ...entry });
-  if (deps.logDir) {
-    const logPath = routeLogPathFor(deps.logDir);
+  const logDir = logDirOf(deps);
+  if (logDir) {
+    const logPath = routeLogPathFor(logDir);
     try { appendFileSync(logPath, `${line}\n`, 'utf8'); } catch (error) {
       warn(deps, `路由决策日志写入失败（${logPath}）：${(error as Error)?.message ?? error}`);
     }
-    maybePruneLog(deps);
+    maybePruneLog(deps, logDir);
   }
   try { deps.logger?.info?.('[dsh-mrrp:route]', line); } catch { /* ignore */ }
 }
@@ -90,15 +105,14 @@ function routeLog(deps: RouteAdapterDeps, entry: Record<string, unknown>): void 
  *  避免每次写入都全文件扫描。保留天数取配置 logRetentionDays（默认 30，1~365）。 */
 const ROUTE_LOG_PRUNE_INTERVAL_MS = 6 * 60 * 60 * 1000;
 let lastRouteLogPruneAt = 0;
-function maybePruneLog(deps: RouteAdapterDeps): void {
-  const logDir = deps.logDir;
-  if (!logDir) return;
+function maybePruneLog(deps: RouteAdapterDeps, dir: string): void {
+  if (!dir) return;
   const now = Date.now();
   if (now - lastRouteLogPruneAt < ROUTE_LOG_PRUNE_INTERVAL_MS) return;
   lastRouteLogPruneAt = now;
   const maxAgeDays = deps.getConfig().logRetentionDays || 30;
-  try { pruneRouteLogDir(logDir, maxAgeDays, now); } catch { /* 清理失败不影响路由 */ }
-  try { pruneRouteLogFile(routeLogPathFor(logDir), maxAgeDays, now); } catch { /* 清理失败不影响路由 */ }
+  try { pruneRouteLogDir(dir, maxAgeDays, now); } catch { /* 清理失败不影响路由 */ }
+  try { pruneRouteLogFile(routeLogPathFor(dir), maxAgeDays, now); } catch { /* 清理失败不影响路由 */ }
 }
 
 /** 从生成请求中提取「最后一条用户消息」文本（供决策模型判断任务内容）。 */
@@ -421,6 +435,17 @@ export function createRouteAdapter(deps: RouteAdapterDeps): Record<string, any> 
     },
 
     async listModels(provider: string) {
+      // 「启动决策模型」关闭时不暴露虚拟模型：宿主对话模型选择器与 MRRP 控制台「模型列表」
+      // 都是从 llm.listModels(provider) 汇总，这里返回空数组即可同时隐藏，
+      // 避免开关关掉后列表里还挂着「MRRP 智能路由」。
+      let enabled = true;
+      try {
+        enabled = !!deps.getConfig()?.route?.imRoute?.enabled;
+      } catch {
+        // 配置读取异常时保持暴露，避免因读取失败把模型从列表里误删
+        enabled = true;
+      }
+      if (!enabled) return [];
       return [{
         provider: provider || ROUTE_PROVIDER,
         id: ROUTE_MODEL,
@@ -727,6 +752,44 @@ export function buildFailoverChain(
   return out.slice(0, Math.max(1, limit));
 }
 
+/**
+ * 识别「以 finish 事件表达的失败」。
+ *
+ * 宿主不会把下游 provider 的错误抛出来：它把 adapter / provider 的异常归一化成终态
+ * `{ type:'finish', reason:{ kind:'error', failure:{ message, code, status } } }`（abort 同理，kind='aborted'）。
+ * 只看「流正常结束」就会把「限流 / 额度不足 / 错误码」当成一次成功但没内容的回复，
+ * 兜底模型永远不会被拉起——这正是「决策出来的模型报错却不走兜底」的直接原因。
+ */
+function failureOfFinishChunk(chunk: Record<string, any>): { kind: string; code: string; status?: number; message: string } | null {
+  if (String(chunk.type ?? '').toLowerCase() !== 'finish') return null;
+  const reason = isRecord(chunk.reason) ? (chunk.reason as Record<string, any>) : null;
+  if (!reason) return null;
+  const kind = String(reason.kind ?? '').toLowerCase();
+  if (kind !== 'error' && kind !== 'aborted') return null;
+  const failure = isRecord(reason.failure) ? (reason.failure as Record<string, any>) : {};
+  return {
+    kind,
+    code: typeof failure.code === 'string' ? failure.code : '',
+    status: typeof failure.status === 'number' ? failure.status : undefined,
+    message: typeof failure.message === 'string' ? failure.message : '',
+  };
+}
+
+/** 该 chunk 是否已经让用户/宿主看到了真实内容（决定还能不能再换模型续接）。usage / finish / 空块不算。 */
+function chunkHasContent(chunk: unknown): boolean {
+  if (!isRecord(chunk)) return false;
+  const record = chunk as Record<string, any>;
+  // 宿主早期/简化形态可能只给 { text }（没有 type），只要有非空文本就算已输出
+  if (typeof record.text === 'string' && record.text.trim().length > 0) return true;
+  const type = String(record.type ?? '').toLowerCase();
+  if (type === 'text-delta' || type === 'reasoning-delta') return String(record.text ?? '').trim().length > 0;
+  if (type === 'tool-call-delta') return true;
+  if (type === 'block-start' || type === 'block-end') return true;
+  if (type === 'text' || type === 'reasoning' || type === 'content') return String(record.text ?? '').trim().length > 0;
+  if (type === 'tool-call' || type === 'tool_call') return true;
+  return false;
+}
+
 /** 单次转发：把 options 的 provider/model 换成目标真实模型，输出流原样透传（错误一律抛给调用方）。 */
 async function* forwardAttempt(
   deps: RouteAdapterDeps,
@@ -744,15 +807,30 @@ async function* forwardAttempt(
   const forwarded: Record<string, any> = { ...options, provider: parsed.provider, model: parsed.model };
   // 多模态输入规范化为目标模型可识别格式（image_url），否则带图消息转发后图片失效
   normalizeMultimodalInput(forwarded);
+  const session = typeof options.sessionId === 'string' ? options.sessionId : '';
   const seenOutKinds = new Set<string>();
   const stream = deps.host.llm.stream(forwarded);
   for await (const chunk of stream) {
     // 输出块观测：目标模型返回的图片/视频/音频/文件等非文本块（首样本去重），确认生成输出透传形状
     if (isRecord(chunk)) {
       const kind = String((chunk as Record<string, any>).type || (chunk as Record<string, any>).kind || '').toLowerCase();
+      // 失败哨兵：宿主以上述 finish 事件表达限流 / 额度不足 / 错误码，抛出去让容灾换模型
+      const failure = failureOfFinishChunk(chunk as Record<string, any>);
+      if (failure) {
+        routeLog(deps, {
+          event: 'model-failure', session, model: modelKey, kind: failure.kind,
+          code: failure.code || null, status: failure.status ?? null, message: failure.message.slice(0, 300),
+        });
+        if (failure.kind === 'aborted') { yield chunk; return; } // 用户主动停止：不切换，也不当失败
+        const detail = `${failure.code ? `（${failure.code}${failure.status ? ` / HTTP ${failure.status}` : ''}）` : ''}${failure.message || '模型服务返回错误但未给出原因'}`;
+        const error = new Error(`目标模型 ${modelKey} 调用失败${detail}`);
+        (error as Record<string, any>).code = failure.code || 'model-failed';
+        (error as Record<string, any>).status = failure.status;
+        throw error;
+      }
       if (kind && kind !== 'text' && !seenOutKinds.has(kind)) {
         seenOutKinds.add(kind);
-        routeLog(deps, { event: 'forward-media', session: options.sessionId ?? '', model: modelKey, kind, fields: Object.keys(chunk as Record<string, any>).slice(0, 20) });
+        routeLog(deps, { event: 'forward-media', session, model: modelKey, kind, fields: Object.keys(chunk as Record<string, any>).slice(0, 20) });
       }
     }
     yield chunk;
@@ -796,7 +874,8 @@ async function* forwardWithFailover(
     for (let retry = 0; retry <= retries; retry += 1) {
       try {
         for await (const chunk of forwardAttempt(deps, options, model)) {
-          emitted = true;
+          // 只有真的产出了内容才算「已经让用户看到」，usage / finish 之类的元数据块不该锁死容灾
+          if (chunkHasContent(chunk)) emitted = true;
           yield chunk;
         }
         if (failures.length) {

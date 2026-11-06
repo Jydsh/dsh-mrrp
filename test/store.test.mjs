@@ -1,8 +1,8 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, readFileSync, existsSync } from 'node:fs';
+import { mkdtempSync, readFileSync, existsSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, sep } from 'node:path';
 import { randomUUID } from 'node:crypto';
 
 import {
@@ -12,6 +12,9 @@ import {
   sanitizeCategory,
   sanitizeDecisionProvider,
   sanitizeUser,
+  sanitizeLogDir,
+  resolveRouteLogDir,
+  probeLogDir,
   MrrpConfigStore,
 } from '../dist/store.js';
 
@@ -108,6 +111,45 @@ test('sanitizeConfig logRetentionDays 钳制 1~365，缺省 30', () => {
   assert.equal(sanitizeConfig({ logRetentionDays: 999 }).logRetentionDays, 365);
   assert.equal(sanitizeConfig({ logRetentionDays: 7.6 }).logRetentionDays, 8);
   assert.equal(sanitizeConfig({ logRetentionDays: 'bogus' }).logRetentionDays, 30);
+});
+
+test('sanitizeLogDir 只接受绝对路径：相对路径 / 超长 / 含空字节一律回退默认（空串）', () => {
+  const custom = process.platform === 'win32' ? 'D:\\dsh\\mrrp-logs' : '/var/log/mrrp';
+  assert.equal(sanitizeLogDir(''), '');
+  assert.equal(sanitizeLogDir('   '), '');
+  assert.equal(sanitizeLogDir('logs'), '');
+  assert.equal(sanitizeLogDir('./logs'), '');
+  assert.equal(sanitizeLogDir(custom), custom);
+  assert.equal(sanitizeLogDir(`  ${custom}  `), custom);
+  assert.equal(sanitizeLogDir(custom + sep), custom);
+  assert.equal(sanitizeLogDir(`${custom}${sep}${sep}`), custom);
+  assert.equal(sanitizeLogDir('a'.repeat(600)), '');
+  assert.equal(sanitizeLogDir(`${custom}\u0000x`), '');
+  assert.equal(sanitizeLogDir(123), '');
+  assert.equal(sanitizeConfig({}).logDir, '');
+  assert.equal(sanitizeConfig({ logDir: 'relative' }).logDir, '');
+  assert.equal(sanitizeConfig({ logDir: custom }).logDir, custom);
+});
+
+test('resolveRouteLogDir 未配置或非法时回退 config.json 所在目录', () => {
+  const isWin = process.platform === 'win32';
+  const cfgPath = isWin ? 'C:\\Users\\x\\.dsh\\config.json' : '/root/.dsh/config.json';
+  const fallback = isWin ? 'C:\\Users\\x\\.dsh' : '/root/.dsh';
+  const custom = isWin ? 'D:\\dsh\\mrrp-logs' : '/var/log/mrrp';
+  assert.equal(resolveRouteLogDir(cfgPath, ''), fallback);
+  assert.equal(resolveRouteLogDir(cfgPath, undefined), fallback);
+  assert.equal(resolveRouteLogDir(cfgPath, 'relative/dir'), fallback);
+  assert.equal(resolveRouteLogDir(cfgPath, custom), custom);
+});
+
+test('probeLogDir：可创建且可写的目录返回空串，不可用路径返回失败原因', () => {
+  const dir = join(mkdtempSync(join(tmpdir(), 'mrrp-logdir-')), 'nested', 'logs');
+  assert.equal(probeLogDir(dir), '');
+  assert.equal(existsSync(dir), true);
+  // 用「已存在的同名文件」占位，制造无法当目录使用的情况
+  const blocker = join(mkdtempSync(join(tmpdir(), 'mrrp-blocker-')), 'occupied');
+  writeFileSync(blocker, 'x');
+  assert.notEqual(probeLogDir(blocker), '');
 });
 
 test('sanitizeConfig typeSceneList 非法/空回退默认，合法数组去重截断', () => {

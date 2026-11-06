@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
+import { mkdirSync, unlinkSync, writeFileSync } from 'node:fs';
 import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
-import { dirname, resolve } from 'node:path';
+import { dirname, isAbsolute, join, normalize, resolve } from 'node:path';
 import { mrrpConfigPathFor } from './profile.js';
 
 /**
@@ -207,6 +208,8 @@ export interface PluginConfig {
   typeSceneList: string[];
   /** 路由决策日志自动清理保留天数（1~365，默认 30） */
   logRetentionDays: number;
+  /** 路由决策日志存放目录（绝对路径）；空串表示默认「与 config.json 同目录」 */
+  logDir: string;
   /** GitHub 仓库路径（owner/repo），版本检查用；缺省使用插件默认仓库（Jydsh/dsh-mrrp） */
   updateRepo?: string;
 }
@@ -288,7 +291,43 @@ export const DEFAULT_CONFIG: Readonly<PluginConfig> = Object.freeze({
   modelProfiles: {},
   typeSceneList: DEFAULT_TYPE_SCENES.slice(),
   logRetentionDays: 30,
+  logDir: '',
 }) as unknown as Readonly<PluginConfig>;
+
+/**
+ * 日志目录清洗：空串 = 默认（与 config.json 同目录）。
+ * 只接受绝对路径（Windows 盘符 / UNC / POSIX 绝对路径），超长或含空字节的一律回退默认。
+ * 尾部多余分隔符去掉，盘符根（C:\、/）原样保留。
+ */
+export function sanitizeLogDir(value: unknown): string {
+  if (typeof value !== 'string') return '';
+  const text = value.trim();
+  if (!text || text.length > 512 || text.includes('\0')) return '';
+  if (!isAbsolute(text)) return '';
+  const normalized = normalize(text);
+  if (/^[A-Za-z]:[\\/]$/.test(normalized) || normalized === '/') return normalized;
+  const stripped = normalized.replace(/[\\/]+$/, '');
+  return stripped || normalized;
+}
+
+/** 当前生效的日志目录：配置了合法绝对目录就用它，否则回退 config.json 所在目录。 */
+export function resolveRouteLogDir(configPath: string, custom: unknown): string {
+  return sanitizeLogDir(custom) || dirname(configPath);
+}
+
+/** 校验日志目录可用：不存在则递归创建，并写一个探针文件确认真的可写。
+ *  返回失败原因（空串 = 可用）。目录不可写时必须先拦住，否则日志会静默写不进去。 */
+export function probeLogDir(dir: string): string {
+  try {
+    mkdirSync(dir, { recursive: true });
+    const probe = join(dir, `.mrrp-write-probe-${process.pid}-${Date.now()}`);
+    writeFileSync(probe, 'ok', 'utf8');
+    unlinkSync(probe);
+    return '';
+  } catch (error) {
+    return (error as Error)?.message ?? String(error);
+  }
+}
 
 function cleanString(value: unknown, fallback: string, max = MAX_STR): string {
   if (typeof value !== 'string') return fallback;
@@ -595,6 +634,7 @@ export function sanitizeConfig(input: unknown): PluginConfig {
     modelProfiles: sanitizeModelProfiles(source.modelProfiles),
     typeSceneList: sanitizeTypeSceneList(source.typeSceneList),
     logRetentionDays: cleanInt(source.logRetentionDays, 30, 1, 365),
+    logDir: sanitizeLogDir(source.logDir),
   };
 }
 
