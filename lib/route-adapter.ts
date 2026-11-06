@@ -1,7 +1,7 @@
 import { appendFileSync } from 'node:fs';
 import type { ImRouteConfig, PluginConfig } from './store.js';
 import type { ImRoutingDeps, ImRoutingHandle } from './route-engine.js';
-import { extractDecisionValues, parseModelKey, pruneRouteLogDir, pruneRouteLogFile, collectUserModelPool, resolveTargetModelFromPool, routeLogPathFor, type UserModelPool } from './route-engine.js';
+import { extractDecisionValues, extractSenderFromContent, parseModelKey, pruneRouteLogDir, pruneRouteLogFile, collectUserModelPool, resolveTargetModelFromPool, routeLogPathFor, type UserModelPool } from './route-engine.js';
 
 /**
  * MRRP 决策模型路由 adapter（新方案核心）。
@@ -188,6 +188,49 @@ export function lastUserText(options: Record<string, any>): string {
   return '';
 }
 
+/**
+ * 取请求里「本条用户消息」的原始文本（**保留** `<dsh_im_source>` 发送者前缀块）。
+ * 与 lastUserText 的区别仅在于不剥离发送者块：会话事件被宿主剥掉 senderId 时，
+ * 请求体本身仍带着发送者块，可据此恢复发送者身份（resolveSenderFor 回退用）。
+ */
+export function rawUserText(options: Record<string, any>): string {
+  const input = Array.isArray(options.input) ? options.input : [];
+  if (input.length) {
+    const parts: string[] = [];
+    for (const block of input) {
+      if (!isRecord(block)) continue;
+      const t = blockText(block);
+      if (t) parts.push(t);
+    }
+    if (parts.length) return parts.join('\n');
+  }
+  const messages = Array.isArray(options.messages) ? options.messages : [];
+  const idx = lastUserMessageIndex(messages);
+  if (idx >= 0) {
+    const content = messages[idx].content;
+    if (typeof content === 'string' && content.trim()) return content.trim();
+    if (Array.isArray(content)) {
+      const parts: string[] = [];
+      for (const block of content) {
+        if (isRecord(block)) {
+          const t = blockText(block);
+          if (t) parts.push(t);
+        }
+      }
+      if (parts.length) return parts.join('\n');
+    }
+  }
+  for (const field of TOP_TEXT_FIELDS) {
+    const value = options[field];
+    if (typeof value === 'string' && value.trim()) return value.trim();
+    if (isRecord(value)) {
+      const t = blockText(value);
+      if (t) return t;
+    }
+  }
+  return '';
+}
+
 /** 附件类型判定：content block 的 type → image/video/file/audio。 */
 function attachTypeOf(block: Record<string, any>): string {
   const kind = String(block.type || '').toLowerCase();
@@ -316,7 +359,18 @@ interface DecisionCtxEntry {
 export function resolveSenderFor(options: Record<string, any>, registry: ImRoutingHandle): { senderId: string; senderName: string } | null {
   const sessionId = typeof options.sessionId === 'string' && options.sessionId.trim() ? options.sessionId.trim() : '';
   if (!sessionId) return null;
-  return registry.resolveSender(sessionId);
+  const known = registry.resolveSender(sessionId);
+  if (known) return known;
+  // 回退：DSH 的 agent/inbox 事件常把 senderId 从结构化字段里剥掉，只把
+  // `<dsh_im_source>` 块留在用户消息正文里。此时用请求体本身恢复身份，
+  // 并回填映射（后续同会话消息直接命中，不必每条解析）。
+  const fromBody = extractSenderFromContent(rawUserText(options));
+  if (fromBody.senderId) {
+    const sender = { senderId: fromBody.senderId, senderName: fromBody.senderName || fromBody.senderId };
+    try { registry.rememberSender?.(sessionId, sender); } catch { /* 回填失败不影响本次路由 */ }
+    return sender;
+  }
+  return null;
 }
 
 export function createRouteAdapter(deps: RouteAdapterDeps): Record<string, any> {
@@ -328,6 +382,27 @@ export function createRouteAdapter(deps: RouteAdapterDeps): Record<string, any> 
     clearDecisionCache() {
       decisionCtxCache.clear();
       return decisionCtxCache.size;
+    },
+
+    /**
+     * 宿主 token-meter 在切换模型 / 压缩上下文时会向 adapter 询问图片请求定价
+     * （dsh-llm 调用 `this.adapters.get(...).adapter.imageRequestPricing(provider, model)`）。
+     * 基类默认实现返回 undefined，由宿主退回中性估算；本 adapter 是普通对象、不继承基类，
+     * 若缺这个方法宿主会抛 `imageRequestPricing is not a function`，导致
+     * 「Cannot switch to mrrp/route: context compaction failed」把整个 turn 打断。
+     * 本插件只代理目标模型、不改图片，因此明确返回 undefined（与基类默认一致）。
+     */
+    imageRequestPricing(_provider: string, _model: string): unknown {
+      return undefined;
+    },
+
+    /** 图片请求投影：原样转发，保持宿主归一化后的尺寸与字节目标（与基类默认实现一致）。 */
+    imageRequestTarget(_provider: string, _model: string, image: Record<string, any>): unknown {
+      return {
+        width: image?.width,
+        height: image?.height,
+        maxBytes: image?.bytes,
+      };
     },
 
     providerInfo(provider: string) {
@@ -395,7 +470,7 @@ export function createRouteAdapter(deps: RouteAdapterDeps): Record<string, any> 
       if (!cfg?.enabled) {
         routeLog(deps, { event: 'decision-disabled', session, model: cfg?.fallbackModel ?? null });
         if (cfg?.fallbackModel) {
-          return yield* forwardTo(deps, options, cfg.fallbackModel, 'decision-disabled', cfg.fallbackModel);
+          return yield* forwardWithFailover(deps, options, buildFailoverChain(cfg.fallbackModel, []), 'decision-disabled');
         }
         throw new Error('MRRP 决策模型路由未启动：请在「路由配置」页启动决策模型并配置兜底模型。');
       }
@@ -470,7 +545,13 @@ export function createRouteAdapter(deps: RouteAdapterDeps): Record<string, any> 
         ctx: ctxHit ? 'hit' : 'miss',
       });
       warn(deps, `会话 ${options.sessionId} 用户 ${sender.senderName || sender.senderId} 命中模型 ${outcome.model}（来源：${outcome.source}）`);
-      return yield* forwardTo(deps, options, outcome.model, outcome.source, cfg.fallbackModel);
+      // 容灾链：首选 → 候选池其余模型 → 兜底模型（未输出任何内容前失败即静默切换）
+      return yield* forwardWithFailover(
+        deps,
+        options,
+        buildFailoverChain(outcome.model, outcome.candidates ?? [], cfg.fallbackModel),
+        outcome.source,
+      );
     },
   };
 }
@@ -482,14 +563,14 @@ async function* unknownSenderFlow(
   cfg: ImRouteConfig,
 ): AsyncIterable<unknown> {
   if (cfg.unknownUser === 'fallback' && cfg.fallbackModel) {
-    return yield* forwardTo(deps, options, cfg.fallbackModel, 'unknown-fallback', cfg.fallbackModel);
+    return yield* forwardWithFailover(deps, options, buildFailoverChain(cfg.fallbackModel, []), 'unknown-fallback');
   }
   throw new Error('无法解析该会话的发送者：MRRP 尚未观测到本会话的 dsh-im 消息。请先在会话中发送一条消息，或检查「路由配置」页的未注册用户策略。');
 }
 
-/** 转发：把 options 的 provider/model 换成目标真实模型，输出流原样透传。
- *  目标模型调用失败（且尚未产出任何内容）时，自动改用兜底模型重试
- *  （来源 fallback-after-error）；兜底未配置 / 就是失败模型 / 已输出部分内容则不切换。 */
+/** 容灾转发：目标模型服务不可达（且尚未产出任何内容）时，按候选链自动换下一个模型，
+ *  用户直接看到可用模型的回复而不是「暂时无法连接模型服务」；已输出内容后断开则不切换
+ *  （换模型会造成重复回复），详见 forwardWithFailover。 */
 /**
  * 观测宿主调用形态：仅在存在 input 数组 / messages 含非 text 附件块 / 带工具声明时返回结构快照，
  * 用于确认多模态输入各附件元素字段与工具调用是否透传（调试转发兼容；决策 / 转发依赖此信息）。
@@ -617,16 +698,44 @@ export function normalizeMultimodalInput(forwarded: Record<string, any>): void {
   }
 }
 
-async function* forwardTo(
+/** 容灾：一次回复最多尝试的目标模型数（候选池再大也不至于把等待拉爆）。 */
+const FAILOVER_MAX_MODELS = 4;
+/** 容灾：链里只剩一个模型时允许的同模型重试上限（有备选时直接换模型，不原地重试）。 */
+const FAILOVER_MAX_RETRIES = 2;
+
+/**
+ * 构造容灾尝试链：首选 → 候选池其余模型（沿用决策给的候选顺序，直接角色在前）→ 兜底模型。
+ * 剔除重复、无效标识与自身（mrrp/route），最多 `limit` 个模型。
+ */
+export function buildFailoverChain(
+  primary: string,
+  candidates: string[] = [],
+  fallbackModel?: string,
+  limit = FAILOVER_MAX_MODELS,
+): string[] {
+  const out: string[] = [];
+  const push = (raw?: string): void => {
+    const key = (raw ?? '').trim();
+    if (!key || out.includes(key)) return;
+    const parsed = parseModelKey(key);
+    if (!parsed || parsed.provider === ROUTE_PROVIDER) return;
+    out.push(key);
+  };
+  push(primary);
+  for (const candidate of candidates) push(candidate);
+  push(fallbackModel);
+  return out.slice(0, Math.max(1, limit));
+}
+
+/** 单次转发：把 options 的 provider/model 换成目标真实模型，输出流原样透传（错误一律抛给调用方）。 */
+async function* forwardAttempt(
   deps: RouteAdapterDeps,
   options: Record<string, any>,
   modelKey: string,
-  source: string,
-  fallbackModel?: string,
 ): AsyncIterable<unknown> {
   const parsed = parseModelKey(modelKey);
   if (!parsed) {
-    throw new Error(`MRRP 路由的兜底 / 候选模型标识无效（期望 provider:id，实际为「${modelKey}」）。请在「路由配置」页修正。`);
+    throw new Error(`MRRP 路由的目标模型标识无效（期望 provider:id，实际为「${modelKey}」）。请在「路由配置」页修正。`);
   }
   if (parsed.provider === ROUTE_PROVIDER) {
     throw new Error(`MRRP 路由目标不能是自身（${modelKey}），请检查模型分类绑定与兜底模型配置。`);
@@ -635,36 +744,79 @@ async function* forwardTo(
   const forwarded: Record<string, any> = { ...options, provider: parsed.provider, model: parsed.model };
   // 多模态输入规范化为目标模型可识别格式（image_url），否则带图消息转发后图片失效
   normalizeMultimodalInput(forwarded);
-  let emitted = false;
   const seenOutKinds = new Set<string>();
-  try {
-    const stream = deps.host.llm.stream(forwarded);
-    for await (const chunk of stream) {
-      emitted = true;
-      // 输出块观测：目标模型返回的图片/视频/音频/文件等非文本块（首样本去重），确认生成输出透传形状
-      if (isRecord(chunk)) {
-        const kind = String((chunk as Record<string, any>).type || (chunk as Record<string, any>).kind || '').toLowerCase();
-        if (kind && kind !== 'text' && !seenOutKinds.has(kind)) {
-          seenOutKinds.add(kind);
-          routeLog(deps, { event: 'forward-media', session: options.sessionId ?? '', model: modelKey, kind, fields: Object.keys(chunk as Record<string, any>).slice(0, 20) });
-        }
-      }
-      yield chunk;
-    }
-  } catch (error) {
-    const message = (error as Error)?.message ?? error;
-    // 仅当尚未输出任何内容时才切兜底：已输出部分内容时切换会造成重复回复。
-    if (!emitted && fallbackModel && fallbackModel !== modelKey) {
-      const fbParsed = parseModelKey(fallbackModel);
-      if (fbParsed && fbParsed.provider !== ROUTE_PROVIDER) {
-        warn(deps, `转发到 ${modelKey} 失败，启用兜底模型 ${fallbackModel}：${message}`);
-        routeLog(deps, { event: 'fallback-after-error', session: options.sessionId ?? '', model: modelKey, fallback: fallbackModel, message: String(message).slice(0, 500) });
-        const fbForwarded: Record<string, any> = { ...options, provider: fbParsed.provider, model: fbParsed.model };
-        const fbStream = deps.host.llm.stream(fbForwarded);
-        for await (const chunk of fbStream) yield chunk;
-        return;
+  const stream = deps.host.llm.stream(forwarded);
+  for await (const chunk of stream) {
+    // 输出块观测：目标模型返回的图片/视频/音频/文件等非文本块（首样本去重），确认生成输出透传形状
+    if (isRecord(chunk)) {
+      const kind = String((chunk as Record<string, any>).type || (chunk as Record<string, any>).kind || '').toLowerCase();
+      if (kind && kind !== 'text' && !seenOutKinds.has(kind)) {
+        seenOutKinds.add(kind);
+        routeLog(deps, { event: 'forward-media', session: options.sessionId ?? '', model: modelKey, kind, fields: Object.keys(chunk as Record<string, any>).slice(0, 20) });
       }
     }
-    throw new Error(`MRRP 已按权限路由到 ${modelKey}，但该模型调用失败：${message}`);
+    yield chunk;
   }
+}
+
+/**
+ * 容灾转发：按链依次尝试目标模型。**只要还没向宿主输出任何内容**就静默切换，
+ * 用户看到的直接是可用模型的结果，而不是「暂时无法连接模型服务」。
+ *
+ * - `route.failover=false`：链只保留首选，行为等同旧版（不切换）；
+ * - 链里有多个模型时**不在同一模型上原地重试**（连接类故障重试同模型基本无用、还拖慢切换），
+ *   直接换下一个；链里只剩一个模型时才按 `route.retries` 原地重试，保证单模型也有恢复机会；
+ * - **已输出内容后**断开不切换：宿主已把部分内容显示给用户，换模型会造成重复回复或工具重复执行，
+ *   此时抛明确错误（错误消息带上已尝试/正在用的模型）。
+ */
+async function* forwardWithFailover(
+  deps: RouteAdapterDeps,
+  options: Record<string, any>,
+  chain: string[],
+  source: string,
+): AsyncIterable<unknown> {
+  const session = typeof options.sessionId === 'string' ? options.sessionId : '';
+  const route = deps.getConfig()?.route;
+  const enabled = route?.failover !== false;
+  const models = enabled ? chain.filter(Boolean) : chain.filter(Boolean).slice(0, 1);
+  const retries = models.length <= 1
+    ? Math.max(0, Math.min(Number(route?.retries ?? 0) || 0, FAILOVER_MAX_RETRIES))
+    : 0;
+
+  const failures: Array<{ model: string; message: string }> = [];
+  let emitted = false;
+
+  for (let index = 0; index < models.length; index += 1) {
+    const model = models[index];
+    if (index > 0) {
+      const reason = failures[failures.length - 1]?.message ?? '';
+      routeLog(deps, { event: 'failover-switch', session, from: models[index - 1], to: model, reason: reason.slice(0, 300), source });
+      warn(deps, `目标模型 ${models[index - 1]} 不可用，自动切换到 ${model}：${reason}`);
+    }
+    for (let retry = 0; retry <= retries; retry += 1) {
+      try {
+        for await (const chunk of forwardAttempt(deps, options, model)) {
+          emitted = true;
+          yield chunk;
+        }
+        if (failures.length) {
+          routeLog(deps, { event: 'failover-recovered', session, model, tried: [...new Set(failures.map((f) => f.model))], failedAttempts: failures.length, retry });
+          warn(deps, `容灾生效：改由 ${model} 完成本次回复（此前失败 ${failures.length} 次）`);
+        }
+        return;
+      } catch (error) {
+        const message = String((error as Error)?.message ?? error).slice(0, 500);
+        failures.push({ model, message });
+        routeLog(deps, { event: 'attempt-fail', session, model, retry, message, emitted, source });
+        if (emitted) {
+          throw new Error(`MRRP 已路由到 ${model}，但输出过程中与模型服务断开；此前已输出部分内容，换模型续接会造成重复回复，故不再切换：${message}`);
+        }
+        // 未输出任何内容：继续试链里的下一个模型（有备选时 retries=0，立即切换）
+      }
+    }
+  }
+
+  const tried = [...new Set(failures.map((f) => f.model))];
+  routeLog(deps, { event: 'forward-exhausted', session, tried, source });
+  throw new Error(`MRRP 路由到的模型均不可用（依次尝试 ${tried.join(' / ') || '无'}）：${failures[failures.length - 1]?.message ?? '未知错误'}`);
 }

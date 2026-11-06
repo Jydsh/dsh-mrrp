@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
-import { homedir } from 'node:os';
-import { dirname, join, resolve } from 'node:path';
+import { dirname, resolve } from 'node:path';
+import { mrrpConfigPathFor } from './profile.js';
 const MAX_STR = 200;
 const MAX_DESC = 500;
 /** 默认类型/场景列表（模型列表「类型/擅长场景」下拉框初始选项；可在「类型/场景」页增删）。 */
@@ -37,6 +37,16 @@ export const DEFAULT_CONFIG = Object.freeze({
             enabled: false,
             decisionProviderId: '',
             decisionProviderIds: Object.freeze([]),
+            decisionPool: Object.freeze({
+                enabled: true,
+                defaultLimit: 1,
+                queueTimeoutMs: 8_000,
+                sticky: true,
+                primaryProviderId: '',
+                primaryModel: '',
+                limits: Object.freeze({}),
+                weights: Object.freeze({}),
+            }),
             questions: Object.freeze({}),
             rules: Object.freeze([]),
             fallbackModel: '',
@@ -173,6 +183,45 @@ function sanitizeImRouteRules(input) {
     }
     return out;
 }
+/** 清洗「键 -> 整数」映射（并发上限 / 权重共用）。 */
+function cleanNumberMap(value, min, max, limit = 64) {
+    const out = {};
+    if (!value || typeof value !== 'object')
+        return out;
+    let count = 0;
+    for (const [rawKey, rawValue] of Object.entries(value)) {
+        if (typeof rawKey !== 'string')
+            continue;
+        const key = rawKey.trim();
+        const n = Math.round(Number(rawValue));
+        if (!key || key.length > 160 || !Number.isFinite(n))
+            continue;
+        out[key] = Math.min(max, Math.max(min, n));
+        count += 1;
+        if (count >= limit)
+            break;
+    }
+    return out;
+}
+/** 清洗决策模型并发调度配置。 */
+export function sanitizeDecisionPool(input) {
+    const source = (input && typeof input === 'object' ? input : {});
+    const fallback = DEFAULT_CONFIG.route.imRoute.decisionPool;
+    return {
+        enabled: cleanBool(source.enabled, fallback.enabled),
+        defaultLimit: Number.isSafeInteger(source.defaultLimit)
+            ? Math.min(32, Math.max(1, source.defaultLimit))
+            : fallback.defaultLimit,
+        queueTimeoutMs: Number.isFinite(Number(source.queueTimeoutMs))
+            ? Math.min(60_000, Math.max(0, Math.round(Number(source.queueTimeoutMs))))
+            : fallback.queueTimeoutMs,
+        sticky: cleanBool(source.sticky, fallback.sticky),
+        primaryProviderId: cleanString(source.primaryProviderId, '', 40),
+        primaryModel: cleanString(source.primaryModel, '', 128),
+        limits: cleanNumberMap(source.limits, 1, 32),
+        weights: cleanNumberMap(source.weights, 1, 5),
+    };
+}
 /** 清洗 IM 消息路由配置。 */
 export function sanitizeImRoute(input) {
     const source = (input && typeof input === 'object' ? input : {});
@@ -182,6 +231,7 @@ export function sanitizeImRoute(input) {
         enabled: cleanBool(source.enabled, fallback.enabled),
         decisionProviderId: cleanString(source.decisionProviderId, '', 40),
         decisionProviderIds: cleanStringArray(source.decisionProviderIds).slice(0, 8),
+        decisionPool: sanitizeDecisionPool(source.decisionPool),
         questions: sanitizeImRouteQuestions(source.questions),
         rules: sanitizeImRouteRules(source),
         fallbackModel: cleanString(source.fallbackModel, '', 128),
@@ -357,9 +407,9 @@ export function defaultRoleIdFor(config) {
         return '';
     return config.roles.some((role) => role.id === roleId) ? roleId : '';
 }
+/** 配置文件路径：按当前 profile 隔离；profile 认定不出时回退旧的共享位置（不丢配置）。 */
 export function configPath() {
-    const home = resolve(process.env.DSH_HOME ?? join(homedir(), '.dsh'));
-    return join(home, 'integrations', 'dsh-mrrp', 'config.json');
+    return mrrpConfigPathFor();
 }
 export class MrrpConfigStore {
     #path;

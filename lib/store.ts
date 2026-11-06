@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
-import { homedir } from 'node:os';
-import { dirname, join, resolve } from 'node:path';
+import { dirname, resolve } from 'node:path';
+import { mrrpConfigPathFor } from './profile.js';
 
 /**
  * MRRP 控制台的数据契约与持久化存储。
@@ -50,6 +50,26 @@ export interface ImRouteQuestion {
   criteria?: unknown;
 }
 
+/** 决策模型并发调度配置（多 API / 同 API 多模型合成一个池）。 */
+export interface DecisionPoolConfig {
+  /** 启用并发调度（关闭后回到「按提供方轮询 + 故障转移」的旧行为） */
+  enabled: boolean;
+  /** 每个模型默认并发上限 */
+  defaultLimit: number;
+  /** 全部满额时的排队等待上限（毫秒，0 = 不排队直接落兜底） */
+  queueTimeoutMs: number;
+  /** 同一会话优先复用上次成功的模型，避免判定口径来回跳 */
+  sticky: boolean;
+  /** 主用提供方 id（只作优先级，不强制独占） */
+  primaryProviderId: string;
+  /** 主用模型名（与 primaryProviderId 一起定位主用槽） */
+  primaryModel: string;
+  /** 每个槽的并发上限覆盖：key = providerId::model */
+  limits: Record<string, number>;
+  /** 每个槽的权重覆盖（1-5，越大越能多吃并发） */
+  weights: Record<string, number>;
+}
+
 /** IM 消息路由配置（「路由配置」页新增卡片）：启用后 dsh-im 钉钉消息按用户路由模型。 */
 export interface ImRouteConfig {
   /** 启用 IM 消息路由（订阅 DSH 会话事件，按消息发送者路由会话模型） */
@@ -58,6 +78,8 @@ export interface ImRouteConfig {
   decisionProviderId: string;
   /** 决策模型提供方有序列表（负载均衡轮询 + 故障转移按序换用；空时回退 [decisionProviderId]） */
   decisionProviderIds: string[];
+  /** 决策模型并发调度：把选中的提供方及其模型展开成池，按最少在途分流 */
+  decisionPool: DecisionPoolConfig;
   /** 判定问题定义（决策模型 questions，多字段） */
   questions: Record<string, ImRouteQuestion>;
   /** 判定规则：决策输出字段值 -> 模型分类（多字段判定 + 映射表） */
@@ -239,6 +261,16 @@ export const DEFAULT_CONFIG: Readonly<PluginConfig> = Object.freeze({
       enabled: false,
       decisionProviderId: '',
       decisionProviderIds: Object.freeze([]),
+      decisionPool: Object.freeze({
+        enabled: true,
+        defaultLimit: 1,
+        queueTimeoutMs: 8_000,
+        sticky: true,
+        primaryProviderId: '',
+        primaryModel: '',
+        limits: Object.freeze({}),
+        weights: Object.freeze({}),
+      }),
       questions: Object.freeze({}),
       rules: Object.freeze([]),
       fallbackModel: '',
@@ -370,6 +402,43 @@ function sanitizeImRouteRules(input: unknown): ImRouteRule[] {
   return out;
 }
 
+/** 清洗「键 -> 整数」映射（并发上限 / 权重共用）。 */
+function cleanNumberMap(value: unknown, min: number, max: number, limit = 64): Record<string, number> {
+  const out: Record<string, number> = {};
+  if (!value || typeof value !== 'object') return out;
+  let count = 0;
+  for (const [rawKey, rawValue] of Object.entries(value as Record<string, unknown>)) {
+    if (typeof rawKey !== 'string') continue;
+    const key = rawKey.trim();
+    const n = Math.round(Number(rawValue));
+    if (!key || key.length > 160 || !Number.isFinite(n)) continue;
+    out[key] = Math.min(max, Math.max(min, n));
+    count += 1;
+    if (count >= limit) break;
+  }
+  return out;
+}
+
+/** 清洗决策模型并发调度配置。 */
+export function sanitizeDecisionPool(input: unknown): DecisionPoolConfig {
+  const source = (input && typeof input === 'object' ? input : {}) as Record<string, any>;
+  const fallback: DecisionPoolConfig = DEFAULT_CONFIG.route.imRoute.decisionPool;
+  return {
+    enabled: cleanBool(source.enabled, fallback.enabled),
+    defaultLimit: Number.isSafeInteger(source.defaultLimit)
+      ? Math.min(32, Math.max(1, source.defaultLimit))
+      : fallback.defaultLimit,
+    queueTimeoutMs: Number.isFinite(Number(source.queueTimeoutMs))
+      ? Math.min(60_000, Math.max(0, Math.round(Number(source.queueTimeoutMs))))
+      : fallback.queueTimeoutMs,
+    sticky: cleanBool(source.sticky, fallback.sticky),
+    primaryProviderId: cleanString(source.primaryProviderId, '', 40),
+    primaryModel: cleanString(source.primaryModel, '', 128),
+    limits: cleanNumberMap(source.limits, 1, 32),
+    weights: cleanNumberMap(source.weights, 1, 5),
+  };
+}
+
 /** 清洗 IM 消息路由配置。 */
 export function sanitizeImRoute(input: unknown): ImRouteConfig {
   const source = (input && typeof input === 'object' ? input : {}) as Record<string, any>;
@@ -379,6 +448,7 @@ export function sanitizeImRoute(input: unknown): ImRouteConfig {
     enabled: cleanBool(source.enabled, fallback.enabled),
     decisionProviderId: cleanString(source.decisionProviderId, '', 40),
     decisionProviderIds: cleanStringArray(source.decisionProviderIds).slice(0, 8),
+    decisionPool: sanitizeDecisionPool(source.decisionPool),
     questions: sanitizeImRouteQuestions(source.questions),
     rules: sanitizeImRouteRules(source),
     fallbackModel: cleanString(source.fallbackModel, '', 128),
@@ -555,9 +625,9 @@ export function defaultRoleIdFor(config: PluginConfig): string {
   return config.roles.some((role) => role.id === roleId) ? roleId : '';
 }
 
+/** 配置文件路径：按当前 profile 隔离；profile 认定不出时回退旧的共享位置（不丢配置）。 */
 export function configPath(): string {
-  const home = resolve(process.env.DSH_HOME ?? join(homedir(), '.dsh'));
-  return join(home, 'integrations', 'dsh-mrrp', 'config.json');
+  return mrrpConfigPathFor();
 }
 
 export class MrrpConfigStore {

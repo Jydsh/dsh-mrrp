@@ -1,5 +1,13 @@
 import type { CategoryBinding, DecisionProvider, ImRouteConfig, ImRouteQuestion, PluginConfig } from './store.js';
 import { makeLayaDecide, openaiChatDecide } from './decision.js';
+import {
+  buildDecisionSlots,
+  decisionPoolConfig,
+  defaultDecisionScheduler,
+  DECISION_MAX_ATTEMPTS,
+  type DecisionScheduler,
+  type DecisionSlotDef,
+} from './decision-pool.js';
 import { readFileSync, readdirSync, unlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 
@@ -85,6 +93,10 @@ export interface TargetModelOutcome {
   providerId?: string;
   /** 本次决策是否经过故障转移（首个提供方失败后换下一个成功，source=laya 时记录） */
   failover?: boolean;
+  /** 实际执行决策的模型名（并发调度池里选中的槽；本地 laya 为空字符串） */
+  decisionModel?: string;
+  /** 决策排队时长（毫秒）：> 0 表示当时池里有模型在忙、请求排过队 */
+  decisionWaitMs?: number;
   /** 附件能力硬校验是否改选了模型（决策模型把带附件消息判给无能力模型时强制校正） */
   attachmentOverride?: boolean;
 }
@@ -112,6 +124,8 @@ export interface ImRoutingHandle {
   status(): Record<string, unknown>;
   /** 会话 → 发送者映射查询（adapter 用；查不到返回 null） */
   resolveSender(sessionId: string): { senderId: string; senderName: string } | null;
+  /** 由 adapter 从请求正文回填映射（事件观测被拒 / 桥未覆盖时的兜底；实现可忽略） */
+  rememberSender?(sessionId: string, sender: { senderId: string; senderName: string }): void;
 }
 
 const IM_SOURCE_KINDS = new Set(['plugin:dsh-im', 'runtime-context', 'time-context', 'skill-catalog', 'user']);
@@ -165,18 +179,19 @@ function contentToText(content: unknown): string {
 
 /**
  * dsh-im 把发送者信息作为 `<dsh_im_source>` 前缀块附加在用户消息正文之前：
- *   <dsh_im_source>
- *     ... senderId: 具体用户ID ...
- *   </dsh_im_source>
+ *   <dsh_im_source>{"senderId":"xxx","senderName":"张三"}</dsh_im_source>
+ *   <dsh_im_source>senderId: xxx / senderName: 张三</dsh_im_source>
  *   （用户实际消息内容）
- * 解析块内 senderId / senderName，返回 { senderId, senderName, rest }（rest=去掉前缀块后的正文）。
+ * 块内可能是 JSON，也可能是裸键值（dsh-im 不同版本两种形态都出现过），键名后可能带引号，
+ * 因此匹配时容忍键名后的可选引号，避免 JSON 形态因 `"senderId":"…"` 解析失败。
+ * 返回 { senderId, senderName, rest }（rest = 去掉前缀块后的正文）。
  */
-function extractSenderFromContent(content: string): { senderId: string; senderName: string; rest: string } {
+export function extractSenderFromContent(content: string): { senderId: string; senderName: string; rest: string } {
   const m = /<dsh_im_source>([\s\S]*?)<\/dsh_im_source>/.exec(content);
   if (!m) return { senderId: '', senderName: '', rest: content };
   const block = m[1];
-  const id = /senderId\s*[:：]\s*([^\s,，;；"'`}\]]+)/.exec(block)?.[1]?.trim() ?? '';
-  const name = /senderName\s*[:：]\s*([^\r\n]+)/.exec(block)?.[1]?.trim() ?? '';
+  const id = /senderId["']?\s*[:：]\s*["']?([^\s,，;；"'`}\]]+)/.exec(block)?.[1]?.trim() ?? '';
+  const name = /senderName["']?\s*[:：]\s*["']?([^"'`}\r\n]+)/.exec(block)?.[1]?.trim() ?? '';
   const rest = content.slice(m.index + m[0].length).replace(/^\s*\r?\n?/, '');
   return { senderId: id, senderName: name, rest };
 }
@@ -426,11 +441,15 @@ const DECISION_TIMEOUT_MS = 6000;
 /** OpenAI 兼容对话判定超时（普通大模型推理比 laya 判定慢，放宽到 10s）。 */
 const CHAT_DECISION_TIMEOUT_MS = 10_000;
 
-/** 决策执行结果：Laya 原始响应 + 实际使用的提供方 + 是否故障转移。 */
+/** 决策执行结果：Laya 原始响应 + 实际使用的提供方 / 模型 + 是否故障转移。 */
 export interface DecisionRunResult {
   data: unknown;
   providerId: string;
+  /** 实际使用的判定模型名（本地 laya 为空字符串） */
+  model?: string;
   failover: boolean;
+  /** 排队等待时长（毫秒）：大于 0 说明当时池里有模型在忙 */
+  waitMs?: number;
 }
 
 /** 多提供方决策执行器：负载均衡（轮询）+ 故障转移（按序换用）。 */
@@ -439,6 +458,8 @@ export interface DecisionRunner {
     providerIds: string[];
     state: string;
     questions: Record<string, ImRouteQuestion>;
+    /** 会话/用户标识：并发调度下用于粘性复用上次成功的模型 */
+    sessionKey?: string;
     onDecide?: (phase: 'before' | 'after' | 'error', detail: Record<string, unknown>) => void;
   }): Promise<DecisionRunResult | null>;
 }
@@ -453,30 +474,62 @@ export function effectiveDecisionProviderIds(cfg: ImRouteConfig | undefined): st
 }
 
 /**
- * 创建决策执行器：多提供方「负载均衡（轮询起始）+ 故障转移（失败按序换下一个）」。
+ * 创建决策执行器。两条路径：
+ *
+ * 1. **并发调度池（默认）**：把「选中的提供方 + 每个提供方下的模型」展开成池，
+ *    按最少在途分流 —— 某个模型在忙时自动换空闲的模型，不用排队等它；
+ *    全部满额才排队（等 queueTimeoutMs，超时落兜底）；失败换下一个槽（最多 DECISION_MAX_ATTEMPTS 个）。
+ *    主用模型只作优先级，不强制独占。
+ * 2. **旧路径**（`decisionPool.enabled=false`，或池里只有 1 个槽）：按提供方轮询起始 + 顺序故障转移。
+ *
  * - decide 注入（测试）：直接单次调用，providerId 取列表首个；
- * - execute 注入（测试）：替换真实 makeLayaDecide 网络调用，便于断言轮询 / 转移；
- * - 缺省：从 config.decisionProviders 匹配启用的 laya 提供方（format=laya 且 baseUrl 非空）。
+ * - execute 注入（测试）：替换真实网络调用，第 5 参是该槽的模型名。
  */
 export function createDecisionRunner(ctx: {
   getConfig(): PluginConfig;
   decide?: ImRoutingDeps['decide'];
-  execute?: (provider: DecisionProvider, state: string, questions: Record<string, ImRouteQuestion>, timeoutMs: number) => Promise<unknown>;
+  execute?: (provider: DecisionProvider, state: string, questions: Record<string, ImRouteQuestion>, timeoutMs: number, model?: string) => Promise<unknown>;
+  /** 并发调度器（测试注入独立实例，避免用例之间共享在途计数） */
+  scheduler?: DecisionScheduler;
 }): DecisionRunner {
   const providersOf = (config: PluginConfig, ids: string[]): DecisionProvider[] => {
     const out: DecisionProvider[] = [];
     for (const id of ids) {
       const provider = config.decisionProviders.find((item) => item.id === id);
       // 决策提供方支持 laya 与 OpenAI 兼容格式（openai / generic）：
-      // 云端判定型服务（如阿里云 MaaS compatible-mode/systemone、0G decisions）走同一判定协议，
-      // 请求体按格式带判定模型名（modelNames[0]）。
+      // 云端判定型服务（如阿里云 MaaS compatible-mode/systemone、0G decisions）走同一判定协议。
       if (provider && provider.baseUrl && (provider.format === 'laya' || provider.format === 'openai' || provider.format === 'generic')) out.push(provider);
     }
     return out;
   };
+
+  /** 按槽发起一次真实决策（本地 laya 不带 model，其余带该槽的主模型名）。 */
+  const runSlot = async (slot: DecisionSlotDef, state: string, questions: Record<string, ImRouteQuestion>): Promise<unknown> => {
+    const provider = slot.provider;
+    if (ctx.execute) return ctx.execute(provider, state, questions, DECISION_TIMEOUT_MS, slot.model);
+    if (provider.endpoint === 'chat') {
+      // OpenAI 兼容对话判定：普通大模型当判定器
+      const run = openaiChatDecide(() => ({
+        baseUrl: provider.baseUrl,
+        apiKey: provider.apiKey || '',
+        model: slot.model,
+      }), CHAT_DECISION_TIMEOUT_MS);
+      return run({ state, questions });
+    }
+    const decisionModel = provider.format === 'laya' ? '' : slot.model;
+    const run = makeLayaDecide(() => ({
+      baseUrl: provider.baseUrl,
+      apiKey: provider.apiKey || '',
+      endpoint: provider.endpoint,
+      model: decisionModel || undefined,
+    }), DECISION_TIMEOUT_MS);
+    return run({ state, questions });
+  };
+
   let rr = 0;
+
   return {
-    async run({ providerIds, state, questions, onDecide }) {
+    async run({ providerIds, state, questions, onDecide, sessionKey }) {
       const ids = providerIds.filter(Boolean);
       if (!ids.length) return null;
       // 测试注入：直接走 decide（单次）
@@ -492,53 +545,95 @@ export function createDecisionRunner(ctx: {
         }
       }
       // 真实路径：过滤启用的决策提供方（laya / openai / generic，baseUrl 非空）
-      const providers = providersOf(ctx.getConfig(), ids);
+      const config = ctx.getConfig();
+      const providers = providersOf(config, ids);
       if (!providers.length) {
         onDecide?.('error', { providerId: ids[0], message: '未找到启用的决策提供方（format=laya/openai/generic 且 baseUrl 非空）' });
         return null;
       }
-      // 负载均衡：轮询挑起始提供方；故障转移：失败按序换下一个
+
+      const pool = decisionPoolConfig(config.route?.imRoute);
+      const slots = buildDecisionSlots(config, ids);
+      const scheduler = ctx.scheduler ?? defaultDecisionScheduler;
+
+      // 并发调度池：多槽时按最少在途分流（同 API 多模型也各占一个槽）
+      if (pool.enabled && slots.length > 1) {
+        const tried = new Set<string>();
+        const attempts = Math.min(slots.length, DECISION_MAX_ATTEMPTS);
+        let waitTotal = 0;
+        for (let attempt = 0; attempt < attempts; attempt += 1) {
+          const remaining = slots.filter((slot) => !tried.has(slot.key));
+          if (!remaining.length) break;
+          const got = await scheduler.acquire(remaining, {
+            sessionKey,
+            sticky: pool.sticky,
+            queueTimeoutMs: pool.queueTimeoutMs,
+          });
+          if (!got) {
+            onDecide?.(attempt > 0 ? 'error' : 'before', {
+              message: '所有决策模型都在忙，排队等待超时',
+              timeoutMs: pool.queueTimeoutMs,
+              waitMs: waitTotal,
+              failover: attempt > 0,
+            });
+            return null;
+          }
+          const slot = got.slot;
+          const failover = attempt > 0;
+          waitTotal += got.waitMs;
+          try {
+            onDecide?.('before', {
+              providerId: slot.provider.id,
+              provider: { baseUrl: slot.provider.baseUrl, endpoint: slot.provider.endpoint, format: slot.provider.format },
+              model: slot.model,
+              waitMs: got.waitMs,
+              state,
+              questions,
+              timeoutMs: DECISION_TIMEOUT_MS,
+              failover,
+            });
+            const data = await runSlot(slot, state, questions);
+            scheduler.release(slot, { ok: true, sessionKey });
+            onDecide?.('after', { providerId: slot.provider.id, model: slot.model, waitMs: got.waitMs, raw: data, failover });
+            return { data, providerId: slot.provider.id, model: slot.model, failover, waitMs: waitTotal };
+          } catch (error) {
+            scheduler.release(slot, { ok: false, sessionKey, error: (error as Error)?.message ?? String(error) });
+            tried.add(slot.key);
+            onDecide?.('error', {
+              providerId: slot.provider.id,
+              model: slot.model,
+              message: (error as Error)?.message ?? String(error),
+              waitMs: got.waitMs,
+              failover,
+            });
+          }
+        }
+        return null;
+      }
+
+      // 旧路径：按提供方轮询起始 + 顺序故障转移
       const start = (rr % providers.length);
       rr += 1;
       for (let i = 0; i < providers.length; i += 1) {
         const provider = providers[(start + i) % providers.length];
+        const model = provider.format === 'laya' ? '' : (provider.modelNames?.[0] || '').trim();
+        const slot: DecisionSlotDef = { key: `${provider.id}::${model}`, provider, model, limit: 1, weight: 1, primary: false };
         const failover = i > 0;
         try {
           onDecide?.('before', {
             providerId: provider.id,
             provider: { baseUrl: provider.baseUrl, endpoint: provider.endpoint, format: provider.format },
+            model,
             state,
             questions,
             timeoutMs: DECISION_TIMEOUT_MS,
             failover,
           });
-          let data: unknown;
-          if (ctx.execute) {
-            data = await ctx.execute(provider, state, questions, DECISION_TIMEOUT_MS);
-          } else if (provider.endpoint === 'chat') {
-            // OpenAI 兼容对话判定：普通大模型当判定器（format=openai/generic，无判定协议端点）
-            const run = openaiChatDecide(() => ({
-              baseUrl: provider.baseUrl,
-              apiKey: provider.apiKey || '',
-              model: (provider.modelNames?.[0] || '').trim(),
-            }), CHAT_DECISION_TIMEOUT_MS);
-            data = await run({ state, questions });
-          } else {
-            // 判定协议（systemone / decisions）：云端判定型服务请求体带判定模型名（modelNames[0]），
-            // 如阿里云 MaaS 的 decision-model-preview；本地 laya 不带 model 字段。
-            const decisionModel = provider.format === 'laya' ? '' : (provider.modelNames?.[0] || '').trim();
-            const run = makeLayaDecide(() => ({
-              baseUrl: provider.baseUrl,
-              apiKey: provider.apiKey || '',
-              endpoint: provider.endpoint,
-              model: decisionModel || undefined,
-            }), DECISION_TIMEOUT_MS);
-            data = await run({ state, questions });
-          }
-          onDecide?.('after', { providerId: provider.id, raw: data, failover });
-          return { data, providerId: provider.id, failover };
+          const data = await runSlot(slot, state, questions);
+          onDecide?.('after', { providerId: provider.id, model, raw: data, failover });
+          return { data, providerId: provider.id, model, failover };
         } catch (error) {
-          onDecide?.('error', { providerId: provider.id, message: (error as Error)?.message ?? String(error), failover });
+          onDecide?.('error', { providerId: provider.id, model, message: (error as Error)?.message ?? String(error), failover });
         }
       }
       return null;
@@ -716,6 +811,8 @@ export async function resolveTargetModelFromPool(
     providerIds,
     state,
     questions,
+    // 并发调度下按发送者做粘性：同一用户优先复用上次成功的决策模型
+    sessionKey: senderId || undefined,
     onDecide: deps.onDecide ? ((phase, detail) => deps.onDecide?.(phase, detail)) : undefined,
   });
   if (result) {
@@ -730,9 +827,9 @@ export async function resolveTargetModelFromPool(
       const overridden = enforceAttachmentCapability(picked, candidates, config, attachments);
       if (overridden) {
         log(deps, 'warn', `附件能力校验：决策选中 ${picked} 无对应附件能力，强制改选 ${overridden}（attachment-override）。`);
-        return { model: overridden, source: 'laya', candidates, sources, decision, reasoning: extractReasoning(result.data), providerId: result.providerId, failover: result.failover, attachmentOverride: true };
+        return { model: overridden, source: 'laya', candidates, sources, decision, reasoning: extractReasoning(result.data), providerId: result.providerId, decisionModel: result.model, decisionWaitMs: result.waitMs, failover: result.failover, attachmentOverride: true };
       }
-      return { model: picked, source: 'laya', candidates, sources, decision, reasoning: extractReasoning(result.data), providerId: result.providerId, failover: result.failover };
+      return { model: picked, source: 'laya', candidates, sources, decision, reasoning: extractReasoning(result.data), providerId: result.providerId, decisionModel: result.model, decisionWaitMs: result.waitMs, failover: result.failover };
     }
     log(deps, 'warn', `决策结果未命中候选模型（${picked || '(空)'}），回退兜底模型。`);
   }
@@ -908,6 +1005,24 @@ export function createImRouting(ctx: RoutingCtx, deps: ImRoutingDeps): ImRouting
         bridgeSessions: bridgeSessions.size,
         last: { ...last, at: last.at ? new Date(last.at).toISOString() : null },
       };
+    },
+    /**
+     * 由 adapter 从请求正文的 `<dsh_im_source>` 块回填映射：
+     * 会话事件被宿主剥掉 senderId（或事件形状变化）时，请求体里的发送者块仍可用，
+     * 回填后同一会话后续消息直接命中映射，不必每条都解析正文。
+     */
+    rememberSender(sessionId: string, sender: { senderId: string; senderName: string }) {
+      if (!sessionId || !sender || !sender.senderId) return;
+      if (!senderBySession.has(sessionId) && senderBySession.size >= 20_000) {
+        const oldest = senderBySession.keys().next().value;
+        if (typeof oldest === 'string') senderBySession.delete(oldest);
+      }
+      senderBySession.set(sessionId, {
+        senderId: sender.senderId,
+        senderName: sender.senderName || sender.senderId,
+        at: Date.now(),
+      });
+      log(deps, 'info', `会话映射（请求正文回填）：${sessionId} -> ${sender.senderId}`);
     },
     resolveSender(sessionId: string) {
       if (!sessionId) return null;

@@ -6,7 +6,8 @@ import type { LlmContext, LlmModel, LlmProvider } from './models.js';
 import { discoverModels, listProviders } from './models.js';
 import { fetchProviderModels, testProvider } from './decision.js';
 import { noopImReader, type ImReader } from './dshim.js';
-import { routeLogPathFor } from './route-engine.js';
+import { routeLogPathFor, effectiveDecisionProviderIds } from './route-engine.js';
+import { buildDecisionSlots, defaultDecisionScheduler, decisionPoolConfig } from './decision-pool.js';
 
 /**
  * RPC 消息契约（lib/client.js ↔ server 管理通道）。
@@ -82,10 +83,12 @@ export interface RpcDeps {
     current(): string | null;
     check(repo?: string): Promise<import('./updater.js').LatestVersionInfo | null>;
     isAtLeast(current: string | null, latest: string | null): boolean;
-    /** 识别当前安装环境（profile / 安装来源 / 可用 CLI / 待执行命令） */
-    detect(repo?: string, version?: string): import('./updater.js').InstallEnv;
-    /** 执行一键更新（自动选对应安装命令） */
-    update(repo?: string, version?: string): Promise<import('./updater.js').UpdateResult>;
+    /** 识别当前安装环境（可用 profile 覆盖，见 UpdateTargetOptions） */
+    detect(options?: import('./updater.js').UpdateTargetOptions): import('./updater.js').InstallEnv;
+    /** 执行一键更新（可用 profile 覆盖） */
+    update(options?: import('./updater.js').UpdateTargetOptions): Promise<import('./updater.js').UpdateResult>;
+    /** 记住用户手动选择的 profile（下次启动直接采信） */
+    remember?(profile: string): void;
   };
 }
 
@@ -491,6 +494,28 @@ export function installRpc(ctx: DshCtx, deps: RpcDeps): { install(): void; dispo
     return testProvider(provider);
   }
 
+  /**
+   * 决策模型并发池状态：按当前选中的提供方展开每个槽（provider + 模型），
+   * 带实时在途 / 成功 / 失败 / 冷却，用来验证「忙了自动换空闲」是否真的生效。
+   */
+  function decisionPoolStats(): { slots: Array<Record<string, unknown>>; config: Record<string, unknown> } {
+    const config = store.get();
+    const ids = effectiveDecisionProviderIds(config.route?.imRoute);
+    const slots = buildDecisionSlots(config, ids);
+    const pool = decisionPoolConfig(config.route?.imRoute);
+    return {
+      slots: defaultDecisionScheduler.stats(slots),
+      config: {
+        enabled: pool.enabled,
+        defaultLimit: pool.defaultLimit,
+        queueTimeoutMs: pool.queueTimeoutMs,
+        sticky: pool.sticky,
+        primaryProviderId: pool.primaryProviderId,
+        primaryModel: pool.primaryModel,
+      },
+    };
+  }
+
   /** 读取当天路由决策日志（route-decision-YYYY-MM-DD.log，append JSON 行），返回最新在前、最多 limit 条。 */
   function logsRead(payload: Record<string, any> | undefined): { logs: Record<string, unknown>[]; path: string } {
     const want = typeof payload?.limit === 'number' && Number.isFinite(payload.limit) ? Math.floor(payload.limit) : 200;
@@ -723,7 +748,7 @@ export function installRpc(ctx: DshCtx, deps: RpcDeps): { install(): void; dispo
     const latest = await updater.check(target);
     const updateAvailable = Boolean(current && latest && !updater.isAtLeast(current, latest.version));
     // 命令按本机真实环境算出，与「一键更新」实际执行的完全一致
-    const env = latest ? updater.detect(target, latest.version) : null;
+    const env = latest ? updater.detect({ repo: target, version: latest.version }) : null;
     return {
       current,
       latest: latest?.version ?? null,
@@ -732,21 +757,32 @@ export function installRpc(ctx: DshCtx, deps: RpcDeps): { install(): void; dispo
       command: updateAvailable ? env?.command || null : null,
       env,
       repo: target ?? null,
+      // profile 结论与候选列表：前端据此决定是直接更新，还是先让用户选是哪一个环境
+      profile: env?.profile ?? null,
+      profileSource: env?.profileSource ?? null,
+      candidates: env?.candidates ?? [],
     };
   }
 
-  /** 一键更新：按识别出的本机环境执行对应安装命令（dsh plugin / pnpm / npm）。 */
-  async function versionUpdate(): Promise<unknown> {
+  /** 一键更新：按识别出的本机环境执行对应安装命令（dsh plugin / pnpm / npm）。
+   *  payload.profile 存在时按用户选择的 profile 执行，并记住该选择。 */
+  async function versionUpdate(payload: Record<string, any> | undefined): Promise<unknown> {
     const updater = deps.updater;
     if (!updater) throw Object.assign(new Error('当前环境不支持一键更新。'), { code: 'unsupported' });
     const repo = store.get().updateRepo;
     const target = typeof repo === 'string' && repo.trim() ? repo.trim() : undefined;
+    const requested = typeof payload?.profile === 'string' ? payload.profile.trim() : '';
     const latest = await updater.check(target);
     if (!latest) {
       throw Object.assign(new Error('无法获取最新版本，请检查网络或稍后重试。'), { code: 'no-latest' });
     }
-    const result = await updater.update(target, latest.version);
-    return { ...result, latest: latest.version };
+    const result = await updater.update({
+      repo: target,
+      version: latest.version,
+      profile: requested || undefined,
+    });
+    if (result.ok && requested) updater.remember?.(requested);
+    return { ...result, latest: latest.version, profile: result.env.profile, requestedProfile: requested || null };
   }
 
   async function dispatch(method: string, payload: Record<string, any> | undefined): Promise<unknown> {
@@ -789,6 +825,7 @@ export function installRpc(ctx: DshCtx, deps: RpcDeps): { install(): void; dispo
     if (method === 'decision.delete') return decisionDelete(payload);
     if (method === 'decision.fetch') return decisionFetch(payload);
     if (method === 'decision.test') return decisionTest(payload);
+    if (method === 'decision.pool.stats') return decisionPoolStats();
     if (method === 'logs.read') return logsRead(payload);
     if (method === 'logs.settings.get') return logsSettingsGet();
     if (method === 'logs.settings.set') return logsSettingsSet(payload);
@@ -799,7 +836,7 @@ export function installRpc(ctx: DshCtx, deps: RpcDeps): { install(): void; dispo
     if (method === 'logs.file.clear') return logsFileClear(payload);
     if (method === 'logs.file.prune') return logsFilePrune(payload);
     if (method === 'version.check') return versionCheck();
-    if (method === 'version.update') return versionUpdate();
+    if (method === 'version.update') return versionUpdate(payload);
     throw Object.assign(new Error(`未知操作：${method}`), { code: 'unknown-method' });
   }
 

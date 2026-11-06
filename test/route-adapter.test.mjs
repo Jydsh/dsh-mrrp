@@ -1,6 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { createRouteAdapter, ROUTE_PROVIDER, ROUTE_MODEL, extractAttachmentHints, lastUserText, normalizeMultimodalInput, describeCallShape } from '../dist/route-adapter.js';
+import { createRouteAdapter, ROUTE_PROVIDER, ROUTE_MODEL, extractAttachmentHints, lastUserText, normalizeMultimodalInput, describeCallShape, resolveSenderFor, rawUserText, buildFailoverChain } from '../dist/route-adapter.js';
+import { extractSenderFromContent } from '../dist/route-engine.js';
 
 /** 最小配置：staff_001 经 dept_it -> role_ops 拥有两个候选模型（cat_ops）。 */
 function makeConfig(overrides = {}) {
@@ -104,7 +105,7 @@ test('adapter.stream：同会话连续消息每次都执行 Laya 决策（上下
   assert.ok(logs.some((l) => l.includes('"ctx":"hit"')), 'route 日志标记上下文命中');
 });
 
-test('adapter.stream：转发目标模型失败自动切换兜底模型（未输出内容）', async () => {
+test('adapter.stream：转发目标模型失败（未输出内容）时按候选链自动换模型', async () => {
   const config = makeConfig();
   const logs = [];
   const decide = async () => ({ model: { response: { type: 'choice', choice: 'dashscope:qwen-turbo' } } });
@@ -118,24 +119,31 @@ test('adapter.stream：转发目标模型失败自动切换兜底模型（未输
   const chunks = [];
   for await (const chunk of collectStream(adapter, '服务器挂了')) chunks.push(chunk);
   assert.equal(chunks.length, 1);
-  assert.equal(chunks[0].model, 'qwen-max', '转发失败后改用兜底模型回复');
-  assert.ok(logs.some((l) => l.includes('fallback-after-error')), '记录转发失败切兜底事件');
+  assert.equal(chunks[0].model, 'deepseek-r1', '失败后先切候选池里的下一个模型（候选优先于兜底）');
+  assert.ok(logs.some((l) => l.includes('"event":"failover-switch"')), '记录切换事件');
+  assert.ok(logs.some((l) => l.includes('"event":"failover-recovered"')), '记录容灾生效');
 });
 
-test('adapter.stream：兜底模型就是失败目标模型时不重试，直接抛错', async () => {
+test('adapter.stream：兜底模型与首选同名也不重复请求，仍会试候选里的其它模型', async () => {
   const config = makeConfig({ route: { ...makeConfig().route, imRoute: { ...makeConfig().route.imRoute, fallbackModel: 'dashscope:qwen-turbo' } } });
   const decide = async () => ({ model: { response: { type: 'choice', choice: 'dashscope:qwen-turbo' } } });
-  const streamImpl = async function* () { throw new Error('upstream down'); };
+  const called = [];
+  const streamImpl = async function* (opts) {
+    called.push(opts.model);
+    if (opts.model === 'qwen-turbo') throw new Error('upstream down');
+    yield { provider: opts.provider, model: opts.model, text: 'ok' };
+  };
   const { deps } = adapterDeps(config, { decide, streamImpl });
   const adapter = createRouteAdapter(deps);
 
-  await assert.rejects(
-    async () => { for await (const _ of collectStream(adapter, '服务器挂了')) { /* drain */ } },
-    /调用失败/,
-  );
+  const chunks = [];
+  for await (const chunk of collectStream(adapter, '服务器挂了')) chunks.push(chunk);
+  assert.equal(chunks.length, 1);
+  assert.equal(chunks[0].model, 'deepseek-r1', '首选与兜底同名时去重，改试候选里的其它模型');
+  assert.deepEqual(called, ['qwen-turbo', 'deepseek-r1'], '同名模型不重复请求');
 });
 
-test('adapter.stream：已输出部分内容后失败不切兜底（避免重复回复）', async () => {
+test('adapter.stream：已输出部分内容后失败不换模型（避免重复回复），错误带明确说明', async () => {
   const config = makeConfig();
   const logs = [];
   const decide = async () => ({ model: { response: { type: 'choice', choice: 'dashscope:qwen-turbo' } } });
@@ -151,9 +159,10 @@ test('adapter.stream：已输出部分内容后失败不切兜底（避免重复
 
   await assert.rejects(
     async () => { for await (const _ of collectStream(adapter, '服务器挂了')) { /* drain */ } },
-    /调用失败/,
+    /输出过程中|已输出部分内容/,
   );
-  assert.ok(!logs.some((l) => l.includes('fallback-after-error')), '已输出内容时不切换兜底');
+  assert.ok(!logs.some((l) => l.includes('"event":"failover-switch"')), '已输出内容时不切换模型');
+  assert.ok(logs.some((l) => l.includes('"event":"attempt-fail"')), '记录失败事件');
 });
 
 test('extractAttachmentHints：从 content 数组 / 占位文本 / markdown 提取附件类型', () => {
@@ -403,4 +412,191 @@ test('adapter.stream：消息带图片附件时判定输入携带附件能力提
   assert.equal(chunks[0].model, 'deepseek-r1');
   assert.equal(seen.length, 1);
   assert.ok(seen[0].model.instructions.includes('附件：图片'), '图片附件被识别并带入判定指令');
+});
+
+test('adapter 契约：必须实现宿主的 imageRequestPricing / imageRequestTarget（缺失会在压缩阶段抛 TypeError）', () => {
+  const { deps } = adapterDeps(makeConfig());
+  const adapter = createRouteAdapter(deps);
+  // 宿主 dsh-llm 直接调用 this.adapters.get(...).adapter.imageRequestPricing(provider, model)，
+  // 不检查方法是否存在；缺方法即 TypeError，进而 Cannot switch to mrrp/route。
+  assert.equal(typeof adapter.imageRequestPricing, 'function');
+  assert.equal(typeof adapter.imageRequestTarget, 'function');
+  assert.equal(adapter.imageRequestPricing('mrrp', 'route'), undefined, '不声明定价 → 宿主退回中性估算');
+  assert.deepEqual(
+    adapter.imageRequestTarget('mrrp', 'route', { width: 1024, height: 768, bytes: 2048 }),
+    { width: 1024, height: 768, maxBytes: 2048 },
+    '图片投影与宿主归一化结果一致（原样转发）',
+  );
+});
+
+test('extractSenderFromContent：兼容 dsh-im 的 JSON 发送者块与裸键值形态', () => {
+  const json = extractSenderFromContent('<dsh_im_source>{"senderId":"021724185801860353","senderName":"李鹏"}</dsh_im_source>\n\n上午好');
+  assert.equal(json.senderId, '021724185801860353', 'JSON 形态（值带引号）也能解析出 senderId');
+  assert.equal(json.senderName, '李鹏');
+  assert.equal(json.rest, '上午好');
+
+  const bare = extractSenderFromContent('<dsh_im_source>senderId: 021724, senderName: 李鹏</dsh_im_source>\n你好');
+  assert.equal(bare.senderId, '021724', '裸键值形态保持兼容');
+  assert.equal(bare.senderName, '李鹏');
+  assert.equal(bare.rest, '你好');
+
+  assert.equal(extractSenderFromContent('没有前缀块').senderId, '');
+});
+
+test('resolveSenderFor：事件映射缺失时从请求正文恢复发送者并回填映射', () => {
+  const remembered = [];
+  const registry = {
+    resolveSender: () => null,
+    rememberSender: (sessionId, sender) => remembered.push({ sessionId, sender }),
+  };
+  const options = {
+    sessionId: 'sess-dingtalk-1',
+    messages: [{ role: 'user', content: '<dsh_im_source>{"senderId":"u-9","senderName":"张三"}</dsh_im_source>\n\n你好' }],
+  };
+  const sender = resolveSenderFor(options, registry);
+  assert.deepEqual(sender, { senderId: 'u-9', senderName: '张三' });
+  assert.equal(remembered.length, 1, '回填一次映射，后续同会话可直接命中');
+  assert.equal(remembered[0].sessionId, 'sess-dingtalk-1');
+});
+
+test('resolveSenderFor：已有映射优先，不再解析正文', () => {
+  let parsed = 0;
+  const registry = {
+    resolveSender: () => ({ senderId: 'staff_001', senderName: '李鹏' }),
+    rememberSender: () => { parsed += 1; },
+  };
+  const options = { sessionId: 's1', messages: [{ role: 'user', content: '<dsh_im_source>{"senderId":"other"}</dsh_im_source>\n嗨' }] };
+  assert.deepEqual(resolveSenderFor(options, registry), { senderId: 'staff_001', senderName: '李鹏' });
+  assert.equal(parsed, 0);
+});
+
+test('rawUserText：保留发送者前缀块（lastUserText 则剥离）', () => {
+  const options = { messages: [{ role: 'user', content: '<dsh_im_source>{"senderId":"u-1"}</dsh_im_source>\n正文内容' }] };
+  assert.ok(rawUserText(options).includes('<dsh_im_source>'), 'raw 版本保留前缀块');
+  assert.equal(lastUserText(options), '正文内容', '决策用版本剥离前缀块');
+});
+
+// ---------- 容灾（模型服务不可达时自动换模型） ----------
+
+/** 跑一次完整 stream，返回 { chunks, error }（不因模型报错中断测试）。 */
+async function runStream(adapter) {
+  const chunks = [];
+  try {
+    for await (const chunk of adapter.stream({
+      sessionId: 's1',
+      provider: ROUTE_PROVIDER,
+      model: ROUTE_MODEL,
+      messages: [{ role: 'user', content: '你好' }],
+    }, null, undefined)) chunks.push(chunk);
+  } catch (error) {
+    return { chunks, error };
+  }
+  return { chunks, error: null };
+}
+
+test('容灾：首选模型连不上（且未输出内容）时自动切候选里的下一个，用户只看到成功模型的回复', async () => {
+  const config = makeConfig();
+  const logs = [];
+  const called = [];
+  const streamImpl = async function* (opts) {
+    called.push(`${opts.provider}:${opts.model}`);
+    if (opts.model === 'qwen-turbo') throw new Error('无法连接模型服务（ECONNREFUSED 127.0.0.1:11434）');
+    yield { text: '来自备选模型的回复' };
+  };
+  const decide = async () => ({ model: { response: { type: 'choice', choice: 'dashscope:qwen-turbo' } } });
+  const { deps } = adapterDeps(config, { decide, logs, streamImpl });
+  const adapter = createRouteAdapter(deps);
+
+  const { chunks, error } = await runStream(adapter);
+
+  assert.equal(error, null, '不应把「无法连接模型服务」抛给用户');
+  assert.equal(chunks.length, 1);
+  assert.equal(chunks[0].text, '来自备选模型的回复');
+  assert.deepEqual(called, ['dashscope:qwen-turbo', 'ollama:deepseek-r1'], '失败后切到候选池里的下一个模型');
+  const events = logs.join('\n');
+  assert.ok(events.includes('"event":"attempt-fail"'), '记录失败模型');
+  assert.ok(events.includes('"event":"failover-switch"'), '记录切换');
+  assert.ok(events.includes('"event":"failover-recovered"'), '记录容灾生效');
+});
+
+test('容灾：候选与兜底全部不可用时抛出汇总错误，不去给用户一个含糊的「暂时无法连接」', async () => {
+  const config = makeConfig();
+  const calls = [];
+  const streamImpl = async function* (opts) {
+    calls.push(`${opts.provider}:${opts.model}`);
+    throw new Error('无法连接模型服务');
+  };
+  const decide = async () => ({ model: { response: { type: 'choice', choice: 'dashscope:qwen-turbo' } } });
+  const { deps } = adapterDeps(config, { decide, streamImpl });
+  const adapter = createRouteAdapter(deps);
+
+  const { error } = await runStream(adapter);
+  assert.ok(error, '全部失败必须明确报错');
+  assert.match(error.message, /均不可用/);
+  for (const model of ['dashscope:qwen-turbo', 'ollama:deepseek-r1', 'dashscope:qwen-max']) {
+    assert.ok(error.message.includes(model), `错误消息应列出尝试过的模型：${model}`);
+  }
+  assert.deepEqual(calls, ['dashscope:qwen-turbo', 'ollama:deepseek-r1', 'dashscope:qwen-max'], '按 首选→候选→兜底 顺序试完');
+});
+
+test('容灾：已输出内容后断开则不换模型（避免重复回复），抛明确错误', async () => {
+  const config = makeConfig();
+  const called = [];
+  const streamImpl = async function* (opts) {
+    called.push(`${opts.provider}:${opts.model}`);
+    yield { text: '前半段已经发给用户了' };
+    throw new Error('ECONNRESET');
+  };
+  const decide = async () => ({ model: { response: { type: 'choice', choice: 'dashscope:qwen-turbo' } } });
+  const { deps } = adapterDeps(config, { decide, streamImpl });
+  const adapter = createRouteAdapter(deps);
+
+  const { chunks, error } = await runStream(adapter);
+  assert.equal(chunks.length, 1, '已输出的内容已经交给宿主，不能撤回');
+  assert.ok(error);
+  assert.match(error.message, /输出过程中|已输出部分内容/);
+  assert.deepEqual(called, ['dashscope:qwen-turbo'], '已输出后不再尝试其它模型');
+});
+
+test('容灾：route.failover=false 时不切换，失败即报错', async () => {
+  const config = makeConfig();
+  config.route.failover = false;
+  const called = [];
+  const streamImpl = async function* (opts) {
+    called.push(`${opts.provider}:${opts.model}`);
+    throw new Error('无法连接模型服务');
+  };
+  const decide = async () => ({ model: { response: { type: 'choice', choice: 'dashscope:qwen-turbo' } } });
+  const { deps } = adapterDeps(config, { decide, streamImpl });
+  const adapter = createRouteAdapter(deps);
+
+  const { error } = await runStream(adapter);
+  assert.ok(error);
+  assert.deepEqual(called, ['dashscope:qwen-turbo'], '开关关闭时只试首选模型');
+});
+
+test('容灾：有备选模型时不原地重试（route.retries 只作用于单模型场景）', async () => {
+  const config = makeConfig();
+  config.route.retries = 2;
+  const called = [];
+  const streamImpl = async function* (opts) {
+    called.push(`${opts.provider}:${opts.model}`);
+    if (opts.model === 'qwen-turbo') throw new Error('无法连接模型服务');
+    yield { text: '备选的回复' };
+  };
+  const decide = async () => ({ model: { response: { type: 'choice', choice: 'dashscope:qwen-turbo' } } });
+  const { deps } = adapterDeps(config, { decide, streamImpl });
+  const adapter = createRouteAdapter(deps);
+
+  const { chunks, error } = await runStream(adapter);
+  assert.equal(error, null);
+  assert.equal(chunks.length, 1);
+  assert.deepEqual(called, ['dashscope:qwen-turbo', 'ollama:deepseek-r1'], '失败一次就换模型，不在同一模型上空耗重试');
+});
+
+test('buildFailoverChain：首选→候选→兜底 去重、剔除自身、上限 4 个', () => {
+  const chain = buildFailoverChain('a:m1', ['a:m2', 'a:m1', `${ROUTE_PROVIDER}:${ROUTE_MODEL}`, 'b:m3', 'c:m4', 'd:m5'], 'a:fallback');
+  assert.deepEqual(chain, ['a:m1', 'a:m2', 'b:m3', 'c:m4'], '自身体/重复项被剔除，最多 4 个模型');
+  assert.deepEqual(buildFailoverChain('a:m1', []), ['a:m1'], '无候选无兜底时只有首选');
+  assert.deepEqual(buildFailoverChain('a:m1', ['badkey'], 'a:fb'), ['a:m1', 'a:fb'], '无效标识不进链');
 });

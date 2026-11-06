@@ -8,12 +8,14 @@ import { createImRouting, pruneRouteLogDir, pruneRouteLogFile, routeLogPathFor }
 import { readDingtalkBridgeSessions } from './dingtalk-bridge.js';
 import { createRouteAdapter } from './route-adapter.js';
 import { checkLatestVersion, detectInstallEnv, getCurrentVersion, isAtLeast, runUpdate } from './updater.js';
+import { ensureProfileConfig, mrrpConfigPathFor, rememberProfile, resolveProfileIdentity } from './profile.js';
 /**
  * dsh-mrrp: MRRP（Model Routing & Resource Planning）控制台插件。
  *
  * host 侧职责：
  *   - 通过 DSH 的 llm 服务只读发现已注册的模型提供方与模型列表；
- *   - 在 ~/.dsh/integrations/dsh-mrrp/config.json 持久化模型分类 / 路由配置 / 角色部门 / 用户 / 决策模型提供方；
+ *   - 在 ~/.dsh/integrations/dsh-mrrp/profiles/<profile>/config.json 持久化模型分类 / 路由配置 / 角色部门 / 用户 / 决策模型提供方
+ *     （同一台机器的 desktop / web 各存一份，识别不出 profile 时回退旧的共享路径）；
  *   - 通过 POST /api/mrrp RPC 通道把这些能力暴露给 MRRP 控制台（client）；
  *   - 注册 laya_decide 工具：调用本地 laya-server 决策模型（TypeSafe Jev 协议，POST /v1/systemone）；
  *   - dsh-im 集成：只读扫描 dsh-im 群历史库（sender_id / sender_name），首次出现的发送者自动创建用户
@@ -91,9 +93,22 @@ function safeJson(value: unknown): string {
 
 export async function apply(ctx: DshContext, config: ApplyConfig = {}): Promise<void> {
   const logger = makeLogger(ctx);
-  const store = new MrrpConfigStore(config.configPath);
+  // 当前环境身份：同一台机器的 desktop / web 各自独立，配置与日志都按 profile 分目录存放。
+  // profile 认定不出时回退旧的共享路径，宁可共用也不把配置写到看不见的地方。
+  const identity = resolveProfileIdentity();
+  const explicitPath = typeof config.configPath === 'string' && config.configPath ? config.configPath : '';
+  const configFile = explicitPath || mrrpConfigPathFor(identity);
+  if (!explicitPath) ensureProfileConfig(identity, configFile);
+  const store = new MrrpConfigStore(configFile);
   // 路由决策日志目录：与 config.json 同目录，按天分文件（route-decision-YYYY-MM-DD.log，append JSON 行）
   const routeLogDir = dirname(store.path);
+  logger.info?.(
+    '[dsh-mrrp] 当前 profile：',
+    identity.profile ?? '未识别',
+    `（依据：${identity.source}${identity.candidates.length ? `，候选：${identity.candidates.join('/')}` : ''}）`,
+    '配置：',
+    store.path,
+  );
   // 会话发送者观测日志：写当天日志文件（与 adapter 共用），宿主 logger 透传。
   const routeLogger = makeRouteLogger(routeLogDir, logger);
   try {
@@ -158,8 +173,10 @@ export async function apply(ctx: DshContext, config: ApplyConfig = {}): Promise<
       current: getCurrentVersion,
       check: checkLatestVersion,
       isAtLeast,
-      detect: detectInstallEnv,
-      update: runUpdate,
+      // 统一带上本进程解析好的 identity，保证配置目录与更新目标指向同一个 profile
+      detect: (options) => detectInstallEnv({ ...options, identity }),
+      update: (options) => runUpdate({ ...options, identity }),
+      remember: rememberProfile,
     },
   });
   try {
