@@ -4,7 +4,7 @@ MRRP（Model Routing & Resource Planning）控制台：DSH 的模型路由与管
 
 管理**模型分类**、**路由配置**、**决策模型配置**、**角色 / 部门** 与 **用户**，让不同角色 / 部门的请求路由到指定分类下的模型。
 
-- 版本：2026.11.06
+- 版本：2026.11.07
 - 兼容：DSH 0.2.1-rc.2（profiles: web / desktop）
 - 协议：TS 优先，client 侧混合 JS（零 JSX，`__ModuleLoader__.load` + 手写 `h()`）
 
@@ -32,13 +32,13 @@ MRRP（Model Routing & Resource Planning）控制台：DSH 的模型路由与管
 ### 桌面版
 
 ```bash
-dsh plugin --profile desktop add ./dsh-mrrp-2026.11.06.tgz
+dsh plugin --profile desktop add ./dsh-mrrp-2026.11.07.tgz
 ```
 
 ### Web 版
 
 ```bash
-dsh plugin --profile web add ./dsh-mrrp-2026.11.06.tgz
+dsh plugin --profile web add ./dsh-mrrp-2026.11.07.tgz
 ```
 
 > `dsh plugin` 必须显式指定 `--profile`（DSH 的插件管理命令，转发给对应 profile 的 pnpm）。安装后**重启 DSH**（桌面版重启桌面端、Web 版重启 Web 端）插件即生效。
@@ -141,11 +141,18 @@ client（JS，lib/client.js，__ModuleLoader__.load 打包进 DSH）
 ## dsh-im 用户打通
 
 - **唯一标识**：用户 `id` 直接使用 dsh-im 对话里的 `senderId`（钉钉场景即 staffId），不再强制 `usr_` 前缀；可解析出该用户的姓名（`sender_name`）。
-- **自动建用户**：插件后台**只读轮询**（默认每 60s，`config.autoSyncIm=false` 可关闭）dsh-im 群历史库，首次出现的发送者自动创建用户（id = senderId、姓名 = sender_name、角色 / 部门留空）。用户页「同步 dsh-im」按钮可手动触发。
+- **自动建用户**：插件后台**只读轮询**（默认每 60s，`config.autoSyncIm=false` 可关闭）下面这几类只读源，首次出现的发送者自动创建用户（id = senderId、姓名 = 能拿到的姓名、角色 / 部门留空）。用户页「同步 dsh-im」按钮可手动触发。
+  1. **dsh-dingtalk 桥 `bots/<botId>/state.json`**（主来源）：`sessions` / `recentOutboundMessages` 里的 `p2p:<staffId>` 就是**当前真实在用的发送者**——只走单聊时这个源最可靠。群聊键 `group:<chatId>` 拿不到唯一发送者，跳过。
+  2. **dsh-im 群历史库 `dsh-im/group-history.sqlite`** 的 `messages` 表：`sender_id` + `sender_name`。注意它**只落群消息**，纯 p2p 场景下这张表可能是空表（0 行），不能只看它。
+  3. **dsh-ding-card `user_names.json`**（`dsh-ding-card/profiles/<profile>/` 优先，也兼容根级旧布局）。
+  4. **dsh-dingtalk `config.json` 的 `bots[].approvedSenders`**。
+
+  上面前两项提供「谁」，后两项补「叫什么」；姓名全部缺失时用 senderId 兜底（控制台可手动改名）。多 profile 并存时 `profiles/*/` 下的库与 JSON 都会被扫到。
+
 - **自动添加默认角色**：在「角色部门 → 角色」列表可把某个角色设为**唯一默认角色**（金色徽标标注；切换时提示原默认角色；默认角色禁止直接删除）。dsh-im 新同步 / 自动创建的用户自动赋该默认角色（走「直接角色」显式授权路线）；已存在用户不受影响；未设默认角色时新用户不赋。
 - **新建 / 编辑弹窗**：新增「ID」字段（新建时手动填写 senderId）；原「用户名」改为「姓名」。
 - **角色回退**：用户可单独绑定角色；未绑定时自动使用其所属部门绑定的角色（多部门取全部部门角色的并集，仅用于展示说明）。
-- **不拦截主链路**：全程只读 dsh-im 数据库，不注册 hook / 中间件；消息入库（由 dsh-im 自身完成）后，下一次轮询即自动补用户。
+- **不拦截主链路**：全程只读 dsh-im / dsh-dingtalk / dsh-ding-card 的数据，不注册 hook / 中间件；任何源缺失、JSON 损坏、库被占用都静默降级，下一次轮询继续尝试。
 
 ## 用户权限控制（IM 侧只读）
 
@@ -307,7 +314,7 @@ curl "https://router-api.0g.ai/v1/decisions" \
 
 ### cordis.patch.yml 配置片段
 
-安装方式（`dsh plugin add ./dsh-mrrp-2026.11.06.tgz`）会自动写入 `cordis.patch.yml` 的 `insert: [{ id: dsh-mrrp }]`。如需用配置文件直接声明 Laya 服务（未在控制台新增提供方时的兜底），在插件的 `config` 下追加：
+安装方式（`dsh plugin add ./dsh-mrrp-2026.11.07.tgz`）会自动写入 `cordis.patch.yml` 的 `insert: [{ id: dsh-mrrp }]`。如需用配置文件直接声明 Laya 服务（未在控制台新增提供方时的兜底），在插件的 `config` 下追加：
 
 ```yaml
 # DSH 配置目录下（如 ~/.dsh/profiles/desktop/cordis.patch.yml）
