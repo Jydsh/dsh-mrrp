@@ -1,7 +1,8 @@
 import { readFileSync, readdirSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import { execFile } from 'node:child_process';
 import { dirname, join } from 'node:path';
-import { defaultRoleIdFor, probeLogDir, resolveRouteLogDir, sanitizeCategory, sanitizeConfig, sanitizeDecisionProvider, sanitizeDept, sanitizeLogDir, sanitizeRole, sanitizeTypeSceneList, sanitizeUser } from './store.js';
+import { defaultRoleIdFor, probeLogDir, resolveRouteLogDir, sanitizeCategory, sanitizeConfig, sanitizeDecisionProvider, sanitizeDept, sanitizeLogDir, sanitizePermissions, sanitizeRole, sanitizeTypeSceneList, sanitizeUser } from './store.js';
+import { resolveUserPermission, summarizePermission } from './permission.js';
 import { discoverModels, listProviders } from './models.js';
 import { fetchProviderModels, testProvider } from './decision.js';
 import { noopImReader } from './dshim.js';
@@ -176,6 +177,45 @@ export function installRpc(ctx, deps) {
         const config = store.get();
         return { depts: config.depts, roles: config.roles, users: config.users };
     }
+    function permissionsList() {
+        const config = store.get();
+        return { permissions: config.permissions, defaultPermissionId: config.defaultPermissionId };
+    }
+    /** 保存权限表 + 未绑定用户的默认权限（空串 = 未绑定一律拒绝）。 */
+    async function permissionsSave(payload) {
+        if (!Array.isArray(payload?.permissions))
+            throw Object.assign(new Error('权限列表格式无效。'), { code: 'bad-request' });
+        const config = store.get();
+        config.permissions = sanitizePermissions(payload.permissions);
+        if (typeof payload.defaultPermissionId === 'string') {
+            const next = payload.defaultPermissionId.trim().slice(0, 40);
+            // 填了就必须是存在的权限 id，否则会静默变成「全部拒绝」
+            if (next && !config.permissions.some((rule) => rule.id === next)) {
+                throw Object.assign(new Error(`默认权限 ${next} 不存在，请选择权限表里的条目。`), { code: 'unknown-permission' });
+            }
+            config.defaultPermissionId = next;
+        }
+        const saved = await store.save(config);
+        return { permissions: saved.permissions, defaultPermissionId: saved.defaultPermissionId };
+    }
+    /** 权限解析预览：某个用户最终落到什么权限（控制台用来核对绑定是否生效）。 */
+    function permissionsResolve(payload) {
+        const userId = typeof payload?.userId === 'string' ? payload.userId.trim() : '';
+        if (!userId)
+            throw Object.assign(new Error('缺少 userId。'), { code: 'bad-request' });
+        const permission = resolveUserPermission(store.get(), userId);
+        return {
+            userId,
+            bound: permission.bound,
+            ruleIds: permission.ruleIds,
+            sources: permission.sources,
+            caps: permission.caps,
+            sandbox: permission.sandbox,
+            approval: permission.approval,
+            toolAllow: permission.toolAllow,
+            summary: summarizePermission(permission),
+        };
+    }
     /**
      * 修复部门树：悬空的 parentId（上级不存在）提升为顶级；返回循环引用所在部门 id（无环则 null）。
      */
@@ -243,6 +283,7 @@ export function installRpc(ctx, deps) {
                 name: (sender.senderName || '').trim() || id,
                 roleId: defaultRoleId,
                 deptIds: [],
+                permissionIds: [],
                 note: '',
             });
             created += 1;
@@ -949,6 +990,12 @@ export function installRpc(ctx, deps) {
             return usersResolve(payload);
         if (method === 'users.syncIm')
             return usersSyncIm();
+        if (method === 'permissions.list')
+            return permissionsList();
+        if (method === 'permissions.save')
+            return permissionsSave(payload);
+        if (method === 'permissions.resolve')
+            return permissionsResolve(payload);
         if (method === 'sidebar-entry.get')
             return sidebarEntryGet();
         if (method === 'sidebar-entry.set')

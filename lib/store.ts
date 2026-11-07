@@ -129,6 +129,8 @@ export interface Role {
   deptIds: string[];
   /** 绑定到的模型分类及每个分类可用的模型（多选分类） */
   categoryBindings: CategoryBinding[];
+  /** 绑定的权限 id 列表（角色成员继承，与用户/部门权限取最严合并） */
+  permissionIds: string[];
   desc: string;
 }
 
@@ -139,6 +141,41 @@ export interface Dept {
   parentId: string;
   /** 绑定到的角色 id 列表（多对多，与角色表的 deptIds 双向同步） */
   roleIds: string[];
+  /** 绑定的权限 id 列表（部门成员继承，与用户/角色权限取最严合并） */
+  permissionIds: string[];
+}
+
+/** 能力开关：粗粒度权限（会话侧真正生效的是 caps + sandbox + approval 的组合）。 */
+export interface PermissionCaps {
+  /** 允许与 agent 对话（false = 直接拒绝，连模型都不调） */
+  chat: boolean;
+  /** 允许写文件 / 改文件 */
+  fsWrite: boolean;
+  /** 允许执行命令（bash / pwsh / 终端等） */
+  exec: boolean;
+  /** 允许管理插件（安装 / 卸载 / 启停 / 改配置） */
+  pluginManage: boolean;
+  /** 允许系统电源操作（关机 / 重启） */
+  power: boolean;
+  /** 允许接管桌面 / 浏览器 */
+  computerUse: boolean;
+}
+
+/** 一条权限规则：能力开关 + 会话沙箱/审批 + 可选工具白名单覆盖。 */
+export interface PermissionRule {
+  id: string;
+  name: string;
+  desc: string;
+  caps: PermissionCaps;
+  /**
+   * 工具白名单覆盖：非空时，该权限下只放行这里列出的工具（其余按 caps 判断）。
+   * 多个规则同时命中时取交集（空白名单视为不限制，不参与交集）。
+   */
+  toolAllow: string[];
+  /** 会话沙箱模式；空 = 不下发，保持宿主当前设置。 */
+  sandbox: '' | 'read-only' | 'workspace-write' | 'danger-full-access';
+  /** 会话审批策略；空 = 不下发。ask 比 never 更严。 */
+  approval: '' | 'ask' | 'never';
 }
 
 /** 用户。 */
@@ -151,6 +188,8 @@ export interface User {
   roleId: string;
   /** 归属的部门 id 列表（用户可归属于多个部门） */
   deptIds: string[];
+  /** 单独绑定的权限 id 列表（与角色/部门的权限取最严合并） */
+  permissionIds: string[];
   /** 备注 */
   note: string;
 }
@@ -206,6 +245,13 @@ export interface PluginConfig {
   modelProfiles: Record<string, ModelProfile>;
   /** 类型/场景列表（模型列表「类型/擅长场景」下拉框的选项来源；可增删） */
   typeSceneList: string[];
+  /** 角色 / 部门 / 用户绑定的权限规则表 */
+  permissions: PermissionRule[];
+  /**
+   * 未绑定任何权限的用户落到哪条规则：
+   * 空串 = 直接拒绝（默认；陌生人不能借 agent 操作主机）；填权限 id 则按该规则放行。
+   */
+  defaultPermissionId: string;
   /** 路由决策日志自动清理保留天数（1~365，默认 30） */
   logRetentionDays: number;
   /** 路由决策日志存放目录（绝对路径）；空串表示默认「与 config.json 同目录」 */
@@ -249,6 +295,42 @@ export const DEFAULT_CATEGORIES: ReadonlyArray<Readonly<Omit<Category, 'id' | 'c
   { name: '重载任务', desc: '批量 / 长文本 / 高吞吐任务，适合大上下文模型。', modelIds: [], isDefault: false },
 ];
 
+/** 内置权限规则：只读 / 标准 / 管理员。ID 固定，老配置缺失时自动补回。 */
+export const DEFAULT_PERMISSIONS: ReadonlyArray<Readonly<PermissionRule>> = [
+  {
+    id: 'perm_readonly',
+    name: '只读应答',
+    desc: '可以对话与查阅，不能写文件、不能执行命令、不能管插件、不能关机。适合普通群成员。',
+    caps: Object.freeze({ chat: true, fsWrite: false, exec: false, pluginManage: false, power: false, computerUse: false }),
+    toolAllow: [],
+    sandbox: 'read-only',
+    approval: 'ask',
+  },
+  {
+    id: 'perm_standard',
+    name: '标准操作',
+    desc: '可以读写工作区文件、执行只读或受限命令，但插件管理与关机仍需管理员。适合可信同事。',
+    caps: Object.freeze({ chat: true, fsWrite: true, exec: true, pluginManage: false, power: false, computerUse: false }),
+    toolAllow: [],
+    sandbox: 'workspace-write',
+    approval: 'ask',
+  },
+  {
+    id: 'perm_admin',
+    name: '管理员',
+    desc: '全能力：可执行任意命令、管理插件、关机、接管桌面。只应绑定给自己人。',
+    caps: Object.freeze({ chat: true, fsWrite: true, exec: true, pluginManage: true, power: true, computerUse: true }),
+    toolAllow: [],
+    sandbox: 'danger-full-access',
+    approval: 'never',
+  },
+] as unknown as ReadonlyArray<Readonly<PermissionRule>>;
+
+/** 能力开关的全开值（解析时作为 AND 起点；没有任何规则命中时整体拒绝）。 */
+export const PERMISSION_CAPS_ALL: Readonly<PermissionCaps> = Object.freeze({
+  chat: true, fsWrite: true, exec: true, pluginManage: true, power: true, computerUse: true,
+});
+
 export const DEFAULT_CONFIG: Readonly<PluginConfig> = Object.freeze({
   version: 1,
   route: Object.freeze({
@@ -290,6 +372,8 @@ export const DEFAULT_CONFIG: Readonly<PluginConfig> = Object.freeze({
   userDefaults: { roleId: '' },
   modelProfiles: {},
   typeSceneList: DEFAULT_TYPE_SCENES.slice(),
+  permissions: DEFAULT_PERMISSIONS.map((p) => ({ ...p, caps: { ...p.caps }, toolAllow: [] })),
+  defaultPermissionId: '',
   logRetentionDays: 30,
   logDir: '',
 }) as unknown as Readonly<PluginConfig>;
@@ -545,6 +629,7 @@ export function sanitizeRole(input: unknown): Role {
     name: cleanString(source.name, '未命名角色', 60),
     deptIds: cleanStringArray(source.deptIds),
     categoryBindings: sanitizeCategoryBindings(source),
+    permissionIds: cleanStringArray(source.permissionIds, 16),
     desc: cleanString(source.desc, '', MAX_DESC),
   };
 }
@@ -556,6 +641,7 @@ export function sanitizeDept(input: unknown): Dept {
     name: cleanString(source.name, '未命名部门', 60),
     parentId: cleanString(source.parentId, '', 40),
     roleIds: cleanStringArray(source.roleIds),
+    permissionIds: cleanStringArray(source.permissionIds, 16),
   };
 }
 
@@ -572,8 +658,71 @@ export function sanitizeUser(input: unknown): User {
     name: cleanString(source.name, '未命名用户', 60),
     roleId: cleanString(source.roleId, '', 40),
     deptIds,
+    permissionIds: cleanStringArray(source.permissionIds, 16),
     note: cleanString(source.note, '', MAX_DESC),
   };
+}
+
+/** 清洗工具白名单：字符串数组、去重、单条 ≤ 80 字符、最多 300 条。 */
+function sanitizeToolAllow(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const item of value) {
+    if (typeof item !== 'string') continue;
+    const text = item.trim();
+    if (!text || text.length > 80) continue;
+    const key = text.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(text);
+    if (out.length >= 300) break;
+  }
+  return out;
+}
+
+/** 清洗一条权限规则：能力开关逐项布尔、沙箱/审批只在枚举内取值。 */
+export function sanitizePermission(input: unknown): PermissionRule {
+  const source = (input && typeof input === 'object' ? input : {}) as Record<string, any>;
+  const capsInput = (source.caps && typeof source.caps === 'object' ? source.caps : {}) as Record<string, any>;
+  const base = DEFAULT_PERMISSIONS.find((p) => p.id === source.id)?.caps ?? { chat: false, fsWrite: false, exec: false, pluginManage: false, power: false, computerUse: false };
+  const sandboxes = ['', 'read-only', 'workspace-write', 'danger-full-access'];
+  const approvals = ['', 'ask', 'never'];
+  return {
+    id: cleanId(source.id, 'perm'),
+    name: cleanString(source.name, '未命名权限', 60),
+    desc: cleanString(source.desc, '', MAX_DESC),
+    caps: {
+      chat: cleanBool(capsInput.chat, base.chat),
+      fsWrite: cleanBool(capsInput.fsWrite, base.fsWrite),
+      exec: cleanBool(capsInput.exec, base.exec),
+      pluginManage: cleanBool(capsInput.pluginManage, base.pluginManage),
+      power: cleanBool(capsInput.power, base.power),
+      computerUse: cleanBool(capsInput.computerUse, base.computerUse),
+    },
+    toolAllow: sanitizeToolAllow(source.toolAllow),
+    sandbox: sandboxes.includes(source.sandbox) ? source.sandbox : '',
+    approval: approvals.includes(source.approval) ? source.approval : '',
+  };
+}
+
+/** 清洗权限表：内置三条（只读/标准/管理员）缺失时补回，避免把自己锁死；自定义项去重、最多 100 条。 */
+export function sanitizePermissions(value: unknown): PermissionRule[] {
+  const list = Array.isArray(value) ? value.slice(0, 100).map(sanitizePermission) : [];
+  const out: PermissionRule[] = [];
+  const seen = new Set<string>();
+  for (const rule of list) {
+    // 内置权限沿用默认 id；自定义权限 id 重复则丢弃
+    if (!rule.id || seen.has(rule.id)) continue;
+    seen.add(rule.id);
+    out.push(rule);
+  }
+  for (const preset of DEFAULT_PERMISSIONS) {
+    if (!out.some((rule) => rule.id === preset.id)) {
+      out.push({ ...preset, caps: { ...preset.caps }, toolAllow: [] });
+    }
+  }
+  return out;
 }
 
 export function sanitizeDecisionProvider(input: unknown): DecisionProvider {
@@ -633,6 +782,8 @@ export function sanitizeConfig(input: unknown): PluginConfig {
     },
     modelProfiles: sanitizeModelProfiles(source.modelProfiles),
     typeSceneList: sanitizeTypeSceneList(source.typeSceneList),
+    permissions: sanitizePermissions(source.permissions),
+    defaultPermissionId: cleanString(source.defaultPermissionId, '', 40),
     logRetentionDays: cleanInt(source.logRetentionDays, 30, 1, 365),
     logDir: sanitizeLogDir(source.logDir),
   };
@@ -741,5 +892,7 @@ function mergeConfig(base: PluginConfig, partial: unknown): PluginConfig {
       ? { mode: partial.sidebar.mode === 'show' || partial.sidebar.mode === 'hide' ? partial.sidebar.mode : 'auto' }
       : base.sidebar,
     decisionProviders: Array.isArray(partial.decisionProviders) ? partial.decisionProviders : base.decisionProviders,
+    permissions: Array.isArray(partial.permissions) ? partial.permissions : base.permissions,
+    defaultPermissionId: typeof partial.defaultPermissionId === 'string' ? partial.defaultPermissionId : base.defaultPermissionId,
   };
 }

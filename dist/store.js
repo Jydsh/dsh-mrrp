@@ -23,6 +23,40 @@ export const DEFAULT_CATEGORIES = [
     { name: '快速响应', desc: '低延迟问答 / 对话 / 轻量任务，追求速度。', modelIds: [], isDefault: false },
     { name: '重载任务', desc: '批量 / 长文本 / 高吞吐任务，适合大上下文模型。', modelIds: [], isDefault: false },
 ];
+/** 内置权限规则：只读 / 标准 / 管理员。ID 固定，老配置缺失时自动补回。 */
+export const DEFAULT_PERMISSIONS = [
+    {
+        id: 'perm_readonly',
+        name: '只读应答',
+        desc: '可以对话与查阅，不能写文件、不能执行命令、不能管插件、不能关机。适合普通群成员。',
+        caps: Object.freeze({ chat: true, fsWrite: false, exec: false, pluginManage: false, power: false, computerUse: false }),
+        toolAllow: [],
+        sandbox: 'read-only',
+        approval: 'ask',
+    },
+    {
+        id: 'perm_standard',
+        name: '标准操作',
+        desc: '可以读写工作区文件、执行只读或受限命令，但插件管理与关机仍需管理员。适合可信同事。',
+        caps: Object.freeze({ chat: true, fsWrite: true, exec: true, pluginManage: false, power: false, computerUse: false }),
+        toolAllow: [],
+        sandbox: 'workspace-write',
+        approval: 'ask',
+    },
+    {
+        id: 'perm_admin',
+        name: '管理员',
+        desc: '全能力：可执行任意命令、管理插件、关机、接管桌面。只应绑定给自己人。',
+        caps: Object.freeze({ chat: true, fsWrite: true, exec: true, pluginManage: true, power: true, computerUse: true }),
+        toolAllow: [],
+        sandbox: 'danger-full-access',
+        approval: 'never',
+    },
+];
+/** 能力开关的全开值（解析时作为 AND 起点；没有任何规则命中时整体拒绝）。 */
+export const PERMISSION_CAPS_ALL = Object.freeze({
+    chat: true, fsWrite: true, exec: true, pluginManage: true, power: true, computerUse: true,
+});
 export const DEFAULT_CONFIG = Object.freeze({
     version: 1,
     route: Object.freeze({
@@ -64,6 +98,8 @@ export const DEFAULT_CONFIG = Object.freeze({
     userDefaults: { roleId: '' },
     modelProfiles: {},
     typeSceneList: DEFAULT_TYPE_SCENES.slice(),
+    permissions: DEFAULT_PERMISSIONS.map((p) => ({ ...p, caps: { ...p.caps }, toolAllow: [] })),
+    defaultPermissionId: '',
     logRetentionDays: 30,
     logDir: '',
 });
@@ -329,6 +365,7 @@ export function sanitizeRole(input) {
         name: cleanString(source.name, '未命名角色', 60),
         deptIds: cleanStringArray(source.deptIds),
         categoryBindings: sanitizeCategoryBindings(source),
+        permissionIds: cleanStringArray(source.permissionIds, 16),
         desc: cleanString(source.desc, '', MAX_DESC),
     };
 }
@@ -339,6 +376,7 @@ export function sanitizeDept(input) {
         name: cleanString(source.name, '未命名部门', 60),
         parentId: cleanString(source.parentId, '', 40),
         roleIds: cleanStringArray(source.roleIds),
+        permissionIds: cleanStringArray(source.permissionIds, 16),
     };
 }
 export function sanitizeUser(input) {
@@ -355,8 +393,74 @@ export function sanitizeUser(input) {
         name: cleanString(source.name, '未命名用户', 60),
         roleId: cleanString(source.roleId, '', 40),
         deptIds,
+        permissionIds: cleanStringArray(source.permissionIds, 16),
         note: cleanString(source.note, '', MAX_DESC),
     };
+}
+/** 清洗工具白名单：字符串数组、去重、单条 ≤ 80 字符、最多 300 条。 */
+function sanitizeToolAllow(value) {
+    if (!Array.isArray(value))
+        return [];
+    const out = [];
+    const seen = new Set();
+    for (const item of value) {
+        if (typeof item !== 'string')
+            continue;
+        const text = item.trim();
+        if (!text || text.length > 80)
+            continue;
+        const key = text.toLowerCase();
+        if (seen.has(key))
+            continue;
+        seen.add(key);
+        out.push(text);
+        if (out.length >= 300)
+            break;
+    }
+    return out;
+}
+/** 清洗一条权限规则：能力开关逐项布尔、沙箱/审批只在枚举内取值。 */
+export function sanitizePermission(input) {
+    const source = (input && typeof input === 'object' ? input : {});
+    const capsInput = (source.caps && typeof source.caps === 'object' ? source.caps : {});
+    const base = DEFAULT_PERMISSIONS.find((p) => p.id === source.id)?.caps ?? { chat: false, fsWrite: false, exec: false, pluginManage: false, power: false, computerUse: false };
+    const sandboxes = ['', 'read-only', 'workspace-write', 'danger-full-access'];
+    const approvals = ['', 'ask', 'never'];
+    return {
+        id: cleanId(source.id, 'perm'),
+        name: cleanString(source.name, '未命名权限', 60),
+        desc: cleanString(source.desc, '', MAX_DESC),
+        caps: {
+            chat: cleanBool(capsInput.chat, base.chat),
+            fsWrite: cleanBool(capsInput.fsWrite, base.fsWrite),
+            exec: cleanBool(capsInput.exec, base.exec),
+            pluginManage: cleanBool(capsInput.pluginManage, base.pluginManage),
+            power: cleanBool(capsInput.power, base.power),
+            computerUse: cleanBool(capsInput.computerUse, base.computerUse),
+        },
+        toolAllow: sanitizeToolAllow(source.toolAllow),
+        sandbox: sandboxes.includes(source.sandbox) ? source.sandbox : '',
+        approval: approvals.includes(source.approval) ? source.approval : '',
+    };
+}
+/** 清洗权限表：内置三条（只读/标准/管理员）缺失时补回，避免把自己锁死；自定义项去重、最多 100 条。 */
+export function sanitizePermissions(value) {
+    const list = Array.isArray(value) ? value.slice(0, 100).map(sanitizePermission) : [];
+    const out = [];
+    const seen = new Set();
+    for (const rule of list) {
+        // 内置权限沿用默认 id；自定义权限 id 重复则丢弃
+        if (!rule.id || seen.has(rule.id))
+            continue;
+        seen.add(rule.id);
+        out.push(rule);
+    }
+    for (const preset of DEFAULT_PERMISSIONS) {
+        if (!out.some((rule) => rule.id === preset.id)) {
+            out.push({ ...preset, caps: { ...preset.caps }, toolAllow: [] });
+        }
+    }
+    return out;
 }
 export function sanitizeDecisionProvider(input) {
     const source = (input && typeof input === 'object' ? input : {});
@@ -414,6 +518,8 @@ export function sanitizeConfig(input) {
         },
         modelProfiles: sanitizeModelProfiles(source.modelProfiles),
         typeSceneList: sanitizeTypeSceneList(source.typeSceneList),
+        permissions: sanitizePermissions(source.permissions),
+        defaultPermissionId: cleanString(source.defaultPermissionId, '', 40),
         logRetentionDays: cleanInt(source.logRetentionDays, 30, 1, 365),
         logDir: sanitizeLogDir(source.logDir),
     };
@@ -516,5 +622,7 @@ function mergeConfig(base, partial) {
             ? { mode: partial.sidebar.mode === 'show' || partial.sidebar.mode === 'hide' ? partial.sidebar.mode : 'auto' }
             : base.sidebar,
         decisionProviders: Array.isArray(partial.decisionProviders) ? partial.decisionProviders : base.decisionProviders,
+        permissions: Array.isArray(partial.permissions) ? partial.permissions : base.permissions,
+        defaultPermissionId: typeof partial.defaultPermissionId === 'string' ? partial.defaultPermissionId : base.defaultPermissionId,
     };
 }

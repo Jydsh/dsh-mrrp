@@ -7,6 +7,7 @@ import { makeImReader } from './dshim.js';
 import { createImRouting, pruneRouteLogDir, pruneRouteLogFile, routeLogPathFor } from './route-engine.js';
 import { readDingtalkBridgeSessions } from './dingtalk-bridge.js';
 import { createRouteAdapter } from './route-adapter.js';
+import { resolveUserPermission } from './permission.js';
 import { checkLatestVersion, detectInstallEnv, getCurrentVersion, isAtLeast, runUpdate } from './updater.js';
 import { ensureProfileConfig, mrrpConfigPathFor, rememberProfile, resolveProfileIdentity } from './profile.js';
 /**
@@ -92,6 +93,31 @@ function safeJson(value: unknown): string {
   try { return JSON.stringify(value); } catch { return String(value); }
 }
 
+/**
+ * 把权限规则里的「沙箱模式 / 审批策略」写进 DSH 会话（宿主内核据此拦截命令与文件操作）。
+ * 宿主 `setSandboxMode(session, mode)` / `setApprovalPolicy(session, policy)` 的实现就是
+ * `session.append('sandbox/mode'|'approval/policy', payload)`，这里直接用同一份会话事件契约。
+ * 返回已下发的签名（"read-only/ask" 形式）；会话对象不支持 append 时返回空串（只是没有内核级限制，
+ * adapter 的工具闸门仍然生效）。
+ */
+function applySessionPermission(session: unknown, sandbox: string, approval: string): string {
+  if (!session || typeof (session as Record<string, any>).append !== 'function') return '';
+  const applied: string[] = [];
+  if (sandbox) {
+    try {
+      (session as Record<string, any>).append('sandbox/mode', { mode: sandbox });
+      applied.push(sandbox);
+    } catch { /* 会话已结束或不支持该事件：忽略，工具闸门兜住 */ }
+  }
+  if (approval) {
+    try {
+      (session as Record<string, any>).append('approval/policy', { policy: approval });
+      applied.push(approval);
+    } catch { /* ignore */ }
+  }
+  return applied.join('/');
+}
+
 export async function apply(ctx: DshContext, config: ApplyConfig = {}): Promise<void> {
   const logger = makeLogger(ctx);
   // 当前环境身份：同一台机器的 desktop / web 各自独立，配置与日志都按 profile 分目录存放。
@@ -160,6 +186,15 @@ export async function apply(ctx: DshContext, config: ApplyConfig = {}): Promise<
     getConfig: () => store.get(),
     logger: routeLogger,
     dingtalkBridge: { readSessions: () => readDingtalkBridgeSessions() },
+    // 会话级权限：识别出 IM 发送者后按权限规则下发沙箱/审批；
+    // 未授权用户直接锁到最严（只读 + 每次审批），即使准入判断有遗漏也干不了危险操作。
+    applyPermission: (session, senderId, config) => {
+      const permission = resolveUserPermission(config, senderId);
+      if (!permission.bound || !permission.caps.chat) {
+        return applySessionPermission(session, 'read-only', 'ask');
+      }
+      return applySessionPermission(session, permission.sandbox, permission.approval);
+    },
   });
   try {
     imRouting.start();

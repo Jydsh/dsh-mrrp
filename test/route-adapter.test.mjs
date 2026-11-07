@@ -30,7 +30,7 @@ function makeConfig(overrides = {}) {
       { id: 'dept_it', name: 'IT 部', parentId: '', roleIds: ['role_ops'] },
     ],
     users: [
-      { id: 'staff_001', name: '李鹏', roleId: '', deptIds: ['dept_it'], note: '' },
+      { id: 'staff_001', name: '李鹏', roleId: '', deptIds: ['dept_it'], permissionIds: ['perm_admin'], note: '' },
     ],
     sidebar: { mode: 'auto' },
     decisionProviders: [
@@ -662,3 +662,83 @@ test('buildFailoverChain：首选→候选→兜底 去重、剔除自身、上�
   assert.deepEqual(buildFailoverChain('a:m1', []), ['a:m1'], '无候选无兜底时只有首选');
   assert.deepEqual(buildFailoverChain('a:m1', ['badkey'], 'a:fb'), ['a:m1', 'a:fb'], '无效标识不进链');
 });
+
+/* ============================== 权限准入与工具闸门 ============================== */
+
+test('权限：未绑定任何权限的用户被直接拒绝，且一次模型调用都不发生', async () => {
+  const config = makeConfig({
+    users: [{ id: 'staff_001', name: '李鹏', roleId: '', deptIds: ['dept_it'], permissionIds: [], note: '' }],
+  });
+  const { deps, seen } = adapterDeps(config, { logs: [] });
+  const adapter = createRouteAdapter(deps);
+
+  let error = null;
+  try {
+    for await (const _chunk of collectStream(adapter, '帮我关机')) { /* 不应产出任何内容 */ }
+  } catch (e) { error = e; }
+  assert.ok(error, '必须抛错而不是静默转发');
+  assert.match(error.message, /未绑定任何权限/);
+  assert.equal(seen.length, 0, '准入拒绝发生在转发之前：不调模型、不做决策');
+});
+
+test('权限：只有对话能力时 tools 声明被裁掉，且模型自发生成的被禁工具调用不交给宿主', async () => {
+  const config = makeConfig({
+    users: [{ id: 'staff_001', name: '李鹏', roleId: '', deptIds: ['dept_it'], permissionIds: ['perm_readonly'], note: '' }],
+  });
+  const seen = [];
+  const logs = [];
+  const streamImpl = async function* (opts) {
+    seen.push(opts);
+    // 模型无视 tools 声明，自己生成了一次 bash 调用（应被丢弃）
+    yield { type: 'tool-call', name: 'bash', arguments: '{"command":"shutdown -s -t 0"}' };
+    yield { text: '这条正文要保留' };
+  };
+  const decide = async () => ({ model: { response: { type: 'choice', choice: 'dashscope:qwen-turbo' } } });
+  const { deps } = adapterDeps(config, { decide, streamImpl, logs });
+  const adapter = createRouteAdapter(deps);
+
+  const options = {
+    sessionId: 's1',
+    provider: ROUTE_PROVIDER,
+    model: ROUTE_MODEL,
+    messages: [{ role: 'user', content: '关机' }],
+    tools: [
+      { type: 'function', function: { name: 'bash', description: '执行命令' } },
+      { type: 'function', function: { name: 'write_file', description: '写文件' } },
+      { type: 'function', function: { name: 'read_file', description: '读文件' } },
+    ],
+    tool_choice: { type: 'function', function: { name: 'bash' } },
+  };
+  const chunks = [];
+  for await (const chunk of adapter.stream(options, null, undefined)) chunks.push(chunk);
+
+  const sent = seen[0];
+  assert.deepEqual(sent.tools.map((t) => t.function.name), ['read_file'], '命令工具与写文件工具都没下发给模型');
+  assert.equal(sent.tool_choice, 'auto', '被裁掉的工具不能再被强制指定');
+  assert.equal(chunks.some((c) => c && c.type === 'tool-call'), false, '被禁工具的 tool-call 不能进到宿主');
+  assert.ok(chunks.some((c) => c && c.text === '这条正文要保留'), '正常正文照常透传');
+  assert.ok(logs.some((l) => l.includes('"event":"guard-tools"')), '记录被裁掉的工具名单');
+  assert.ok(logs.some((l) => l.includes('"event":"guard-deny"')), '记录被拦下的工具调用');
+});
+
+test('权限：管理员权限下 tools 与 tool_choice 原样透传', async () => {
+  const config = makeConfig();
+  const seen = [];
+  const streamImpl = async function* (opts) { seen.push(opts); yield { text: 'ok' }; };
+  const decide = async () => ({ model: { response: { type: 'choice', choice: 'dashscope:qwen-turbo' } } });
+  const { deps } = adapterDeps(config, { decide, streamImpl });
+  const adapter = createRouteAdapter(deps);
+
+  const options = {
+    sessionId: 's1',
+    provider: ROUTE_PROVIDER,
+    model: ROUTE_MODEL,
+    messages: [{ role: 'user', content: '你好' }],
+    tools: [{ type: 'function', function: { name: 'bash' } }],
+    tool_choice: { type: 'function', function: { name: 'bash' } },
+  };
+  for await (const _chunk of adapter.stream(options, null, undefined)) { /* 只关心透传 */ }
+  assert.deepEqual(seen[0].tools.map((t) => t.function.name), ['bash']);
+  assert.deepEqual(seen[0].tool_choice, { type: 'function', function: { name: 'bash' } });
+});
+

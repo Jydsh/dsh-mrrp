@@ -73,6 +73,12 @@ export interface ImRoutingDeps {
    * p2p:<staffId> -> DSH sessionId 的映射，可据此解析发送者。
    */
   dingtalkBridge?: { readSessions(): Promise<Map<string, string>> };
+  /**
+   * 会话级权限下发：识别出 IM 发送者后，按该用户的权限规则把
+   * 「沙箱模式 / 审批策略」写进会话（宿主内核据此拦截进程与文件操作）。
+   * 未注入时不做会话级限制，仅保留 adapter 的工具闸门。
+   */
+  applyPermission?: (session: unknown, senderId: string, config: PluginConfig) => string;
 }
 
 /** 目标模型决策结果（adapter 与测试可见）。 */
@@ -859,6 +865,8 @@ export function createImRouting(ctx: RoutingCtx, deps: ImRoutingDeps): ImRouting
   let mappedCount = 0;
   let rejectLogged = false;
   const senderBySession = new Map<string, { senderId: string; senderName: string; at: number }>();
+  /** 已下发过的会话权限签名（sessionId -> "sandbox/approval"），用于避免重复写会话事件。 */
+  const permissionApplied = new Map<string, string>();
 
   // dsh-dingtalk 桥映射（sessionId -> senderId / senderName）：事件观测之外的兜底来源
   const bridgeSessions = new Map<string, string>();
@@ -954,6 +962,19 @@ export function createImRouting(ctx: RoutingCtx, deps: ImRoutingDeps): ImRouting
       }
       senderBySession.set(sessionId, { senderId: info.senderId, senderName: info.senderName, at: Date.now() });
       mappedCount += 1;
+      // 会话级权限下发：按发送者权限把沙箱模式 / 审批策略写进会话（宿主内核据此拦截命令与文件操作）。
+      // 只在签名变化时写入，避免每条消息都往会话事件流里刷同样的权限事件。
+      if (deps.applyPermission) {
+        try {
+          const signature = deps.applyPermission(session, info.senderId, deps.getConfig());
+          if (signature && permissionApplied.get(sessionId) !== signature) {
+            permissionApplied.set(sessionId, signature);
+            log(deps, 'info', `会话权限：${sessionId}（${info.senderName || info.senderId}）→ ${signature}`);
+          }
+        } catch (error) {
+          log(deps, 'warn', `会话权限下发失败（不影响主链路）：${(error as Error)?.message ?? error}`);
+        }
+      }
       last = { at: Date.now(), senderId: info.senderId, senderName: info.senderName, error: '' };
       log(deps, 'info', `会话映射：${sessionId} -> ${info.senderName || info.senderId}${cfg?.enabled ? '（决策模型已启动）' : '（决策模型未启动）'}`);
     } catch (error) {

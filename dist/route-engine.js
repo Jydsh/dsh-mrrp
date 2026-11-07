@@ -719,6 +719,8 @@ export function createImRouting(ctx, deps) {
     let mappedCount = 0;
     let rejectLogged = false;
     const senderBySession = new Map();
+    /** 已下发过的会话权限签名（sessionId -> "sandbox/approval"），用于避免重复写会话事件。 */
+    const permissionApplied = new Map();
     // dsh-dingtalk 桥映射（sessionId -> senderId / senderName）：事件观测之外的兜底来源
     const bridgeSessions = new Map();
     const bridgeNames = new Map();
@@ -818,6 +820,20 @@ export function createImRouting(ctx, deps) {
             }
             senderBySession.set(sessionId, { senderId: info.senderId, senderName: info.senderName, at: Date.now() });
             mappedCount += 1;
+            // 会话级权限下发：按发送者权限把沙箱模式 / 审批策略写进会话（宿主内核据此拦截命令与文件操作）。
+            // 只在签名变化时写入，避免每条消息都往会话事件流里刷同样的权限事件。
+            if (deps.applyPermission) {
+                try {
+                    const signature = deps.applyPermission(session, info.senderId, deps.getConfig());
+                    if (signature && permissionApplied.get(sessionId) !== signature) {
+                        permissionApplied.set(sessionId, signature);
+                        log(deps, 'info', `会话权限：${sessionId}（${info.senderName || info.senderId}）→ ${signature}`);
+                    }
+                }
+                catch (error) {
+                    log(deps, 'warn', `会话权限下发失败（不影响主链路）：${error?.message ?? error}`);
+                }
+            }
             last = { at: Date.now(), senderId: info.senderId, senderName: info.senderName, error: '' };
             log(deps, 'info', `会话映射：${sessionId} -> ${info.senderName || info.senderId}${cfg?.enabled ? '（决策模型已启动）' : '（决策模型未启动）'}`);
         }

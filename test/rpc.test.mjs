@@ -406,6 +406,102 @@ test('decision.fetch 非法地址提示协议', async () => {
   assert.match(r.error.message, /http/);
 });
 
+/* ---------------- 权限：列表 / 保存 / 解析 ---------------- */
+
+test('permissions.list 默认返回内置三条权限，且默认权限为空（= 未绑定一律拒绝）', async () => {
+  const r = await rpc('permissions.list');
+  assert.equal(r.ok, true);
+  const ids = r.value.permissions.map((p) => p.id);
+  assert.deepEqual(ids, ['perm_readonly', 'perm_standard', 'perm_admin']);
+  assert.equal(r.value.defaultPermissionId, '');
+  // 内置权限的能力表与 store 的 DEFAULT_PERMISSIONS 一致
+  const readonly = r.value.permissions.find((p) => p.id === 'perm_readonly');
+  assert.equal(readonly.caps.chat, true);
+  assert.equal(readonly.caps.exec, false);
+  assert.equal(readonly.sandbox, 'read-only');
+  const admin = r.value.permissions.find((p) => p.id === 'perm_admin');
+  assert.equal(admin.caps.computerUse, true);
+  assert.equal(admin.approval, 'never');
+});
+
+test('permissions.save 保存自定义权限 + 默认权限；内置删除后被自动补回', async () => {
+  const custom = {
+    id: 'perm_guest',
+    name: '群里的同事',
+    desc: '只放行读类工具',
+    caps: { chat: true, fsWrite: false, exec: false, pluginManage: false, power: false, computerUse: false },
+    toolAllow: ['Read', 'Search'],
+    sandbox: '',
+    approval: 'ask',
+  };
+  const saved = await rpc('permissions.save', { permissions: [custom, { id: 'perm_readonly', name: '只读应答', caps: { chat: true }, toolAllow: [], sandbox: 'read-only', approval: 'ask' }], defaultPermissionId: 'perm_guest' });
+  assert.equal(saved.ok, true);
+  const ids = saved.value.permissions.map((p) => p.id);
+  assert.ok(ids.includes('perm_guest'), '自定义权限被保留');
+  assert.ok(ids.includes('perm_standard') && ids.includes('perm_admin'), '被删掉的内置权限自动补回（防自锁）');
+  assert.equal(saved.value.defaultPermissionId, 'perm_guest');
+  const back = saved.value.permissions.find((p) => p.id === 'perm_guest');
+  assert.deepEqual(back.toolAllow, ['Read', 'Search']);
+  assert.equal(back.caps.exec, false);
+});
+
+test('permissions.save 默认权限必须存在于权限表，否则报 unknown-permission', async () => {
+  const r = await rpc('permissions.save', { permissions: [], defaultPermissionId: 'perm_not_exist' });
+  assert.equal(r.ok, false);
+  assert.equal(r.error.code, 'unknown-permission');
+  // permissions 字段格式错误 → bad-request
+  const bad = await rpc('permissions.save', { permissions: 'nope' });
+  assert.equal(bad.ok, false);
+  assert.equal(bad.error.code, 'bad-request');
+});
+
+test('permissions.resolve 按 用户→角色→部门 合并，未绑定用户 bound=false', async () => {
+  // 准备：一条只读权限 + 一条标准权限，分别绑到用户自身与部门
+  await rpc('permissions.save', { permissions: [
+    { id: 'perm_read', name: '只读', caps: { chat: true }, toolAllow: [], sandbox: 'read-only', approval: 'ask' },
+    { id: 'perm_work', name: '标准', caps: { chat: true, fsWrite: true }, toolAllow: [], sandbox: 'workspace-write', approval: 'ask' },
+  ], defaultPermissionId: '' });
+  await rpc('depts.save', { depts: [{ id: 'dept_perm', name: '权限部', roleIds: [], permissionIds: ['perm_work'] }] });
+  await rpc('users.save', { users: [
+    { id: 'usr_perm_a', name: '有绑定', roleId: '', deptIds: ['dept_perm'], permissionIds: ['perm_read'] },
+    { id: 'usr_perm_b', name: '没绑定', roleId: '', deptIds: [], permissionIds: [] },
+  ] });
+
+  const a = await rpc('permissions.resolve', { userId: 'usr_perm_a' });
+  assert.equal(a.ok, true);
+  assert.equal(a.value.bound, true);
+  // 自身只读 + 部门标准：caps 逐项取最严 → fsWrite 被否；沙箱取更严 → read-only
+  assert.equal(a.value.caps.chat, true);
+  assert.equal(a.value.caps.fsWrite, false);
+  assert.equal(a.value.sandbox, 'read-only');
+  assert.ok(a.value.ruleIds.includes('perm_read') && a.value.ruleIds.includes('perm_work'));
+  assert.ok(a.value.sources.length >= 2, '来源里能看出用户自身与部门两处绑定');
+  assert.match(a.value.summary, /拒绝|只读|标准|能力=/);
+
+  const b = await rpc('permissions.resolve', { userId: 'usr_perm_b' });
+  assert.equal(b.ok, true);
+  assert.equal(b.value.bound, false);
+  assert.equal(b.value.caps.chat, false, '未绑定兑现为「全部能力关闭」');
+  assert.equal(b.value.sandbox, 'read-only');
+  assert.equal(b.value.summary, '未绑定权限（拒绝）');
+
+  const missing = await rpc('permissions.resolve', {});
+  assert.equal(missing.ok, false);
+  assert.equal(missing.error.code, 'bad-request');
+});
+
+test('users.save 保留 permissionIds；角色/部门的 permissionIds 也会被清洗保存', async () => {
+  await rpc('roles.save', { roles: [{ id: 'role_perm', name: '权限角色', deptIds: [], categoryBindings: [], permissionIds: ['perm_admin'] }] });
+  await rpc('depts.save', { depts: [{ id: 'dept_perm2', name: '权限部2', roleIds: ['role_perm'], permissionIds: ['perm_readonly'] }] });
+  await rpc('users.save', { users: [{ id: 'usr_perm_c', name: '三层绑定', roleId: 'role_perm', deptIds: ['dept_perm2'], permissionIds: ['perm_standard'] }] });
+  const lu = await rpc('users.list');
+  assert.deepEqual(lu.value.users.find((u) => u.id === 'usr_perm_c').permissionIds, ['perm_standard']);
+  const lr = await rpc('roles.list');
+  assert.deepEqual(lr.value.roles.find((r) => r.id === 'role_perm').permissionIds, ['perm_admin']);
+  const ld = await rpc('depts.list');
+  assert.deepEqual(ld.value.depts.find((d) => d.id === 'dept_perm2').permissionIds, ['perm_readonly']);
+});
+
 test('logs.files.list / logs.file.read / logs.file.clear / logs.file.prune：按天文件管理', async () => {
   const today = new Date();
   const pad = (n) => String(n).padStart(2, '0');

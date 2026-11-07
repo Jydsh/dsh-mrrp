@@ -2,6 +2,7 @@ import { appendFileSync } from 'node:fs';
 import type { ImRouteConfig, PluginConfig } from './store.js';
 import type { ImRoutingDeps, ImRoutingHandle } from './route-engine.js';
 import { extractDecisionValues, extractSenderFromContent, parseModelKey, pruneRouteLogDir, pruneRouteLogFile, collectUserModelPool, resolveTargetModelFromPool, routeLogPathFor, type UserModelPool } from './route-engine.js';
+import { deniedToolGroup, resolveUserPermission, summarizePermission, TOOL_GROUP_LABEL, type EffectivePermission } from './permission.js';
 
 /**
  * MRRP 决策模型路由 adapter（新方案核心）。
@@ -491,20 +492,48 @@ export function createRouteAdapter(deps: RouteAdapterDeps): Record<string, any> 
       const callShape = describeCallShape(options);
       if (callShape) routeLog(deps, { event: 'observe-call', session, ...callShape });
 
-      // 1. 未启动决策模型：直接按兜底模型转发（若未配置兜底则明确报错）
+      // 1. 先解析发送者并做权限准入：决策开关开或关，两条转发路径都必须过这道闸。
+      const sender = resolveSenderFor(options, deps.registry);
+      const sessionLabel = sender ? `${sender.senderName || sender.senderId}` : `未识别发送者（会话 ${session || '未知'}）`;
+      if (!sender) {
+        // 会话映射未命中：仍按 unknownUser 策略走，但先按「默认权限」判断能不能对话
+        const fallbackPermission = resolveUserPermission(config, '');
+        if (!fallbackPermission.bound || !fallbackPermission.caps.chat) {
+          routeLog(deps, { event: 'guard-deny', session, senderId: '', senderName: '', reason: 'unknown-sender-unbound', permission: summarizePermission(fallbackPermission) });
+          throw new Error(
+            `会话 ${session || '未知'} 的发送者未识别，且未配置默认权限，本次请求已拒绝。`
+            + '请联系管理员在 MRRP 控制台「权限管理」里设置默认权限，或先把该用户加入用户表。',
+          );
+        }
+        routeLog(deps, { event: 'unknown-sender', session, branch: cfg?.unknownUser === 'fallback' ? 'unknown-fallback' : 'no-route', message: '会话映射未命中发送者' });
+        return yield* unknownSenderFlow(deps, options, cfg);
+      }
+
+      // 2. 权限准入：没有绑定权限、或没有「可对话」能力 → 直接拒绝，不路由也不调模型。
+      //    这是 IM 场景的第一道闸门：钉钉里任何人 @ 机器人都不再等于拿到主机控制权。
+      const permission = resolveUserPermission(config, sender.senderId);
+      if (!permission.bound || !permission.caps.chat) {
+        routeLog(deps, {
+          event: 'guard-deny', session, senderId: sender.senderId, senderName: sender.senderName,
+          reason: permission.bound ? 'no-chat-capability' : 'permission-unbound',
+          permission: summarizePermission(permission),
+        });
+        throw new Error(
+          `用户 ${sender.senderName || sender.senderId} 未获授权使用助手（${permission.bound ? '当前权限不允许对话' : '未绑定任何权限'}）。`
+          + '请联系管理员在 MRRP 控制台「权限管理」里为其分配权限后再试。',
+        );
+      }
+      if (!permission.caps.exec || !permission.caps.pluginManage || !permission.caps.power || !permission.caps.computerUse) {
+        routeLog(deps, { event: 'guard-apply', session, senderId: sender.senderId, senderName: sender.senderName, permission: summarizePermission(permission) });
+      }
+
+      // 3. 未启动决策模型：直接按兜底模型转发（仍受上面的权限与工具闸门约束）
       if (!cfg?.enabled) {
         routeLog(deps, { event: 'decision-disabled', session, model: cfg?.fallbackModel ?? null });
         if (cfg?.fallbackModel) {
-          return yield* forwardWithFailover(deps, options, buildFailoverChain(cfg.fallbackModel, []), 'decision-disabled');
+          return yield* forwardWithFailover(deps, options, buildFailoverChain(cfg.fallbackModel, []), 'decision-disabled', permission);
         }
         throw new Error('MRRP 决策模型路由未启动：请在「路由配置」页启动决策模型并配置兜底模型。');
-      }
-
-      // 2. 会话 → 发送者
-      const sender = resolveSenderFor(options, deps.registry);
-      if (!sender) {
-        routeLog(deps, { event: 'unknown-sender', session, branch: cfg.unknownUser === 'fallback' ? 'unknown-fallback' : 'no-route', message: '会话映射未命中发送者' });
-        return yield* unknownSenderFlow(deps, options, cfg);
       }
 
       // 2.5 决策上下文缓存（候选池复用）：同发送者同配置在 TTL 内复用「用户可用模型池」，
@@ -570,24 +599,25 @@ export function createRouteAdapter(deps: RouteAdapterDeps): Record<string, any> 
         ctx: ctxHit ? 'hit' : 'miss',
       });
       warn(deps, `会话 ${options.sessionId} 用户 ${sender.senderName || sender.senderId} 命中模型 ${outcome.model}（来源：${outcome.source}）`);
-      // 容灾链：首选 → 候选池其余模型 → 兜底模型（未输出任何内容前失败即静默切换）
+      // 容灾链：首选 → 候选池其余模型 → 兜底模型（未输出任何内容前失败即静默切换）；转发层带着权限做工具闸门
       return yield* forwardWithFailover(
         deps,
         options,
         buildFailoverChain(outcome.model, outcome.candidates ?? [], cfg.fallbackModel),
         outcome.source,
+        permission,
       );
     },
   };
 }
 
-/** 未知会话（映射缺失）处理：按 unknownUser 策略走兜底或报错。 */
+/** 未知会话（映射缺失）处理：按 unknownUser 策略走兜底或报错（权限已在调用方按默认权限放行）。 */
 async function* unknownSenderFlow(
   deps: RouteAdapterDeps,
   options: Record<string, any>,
-  cfg: ImRouteConfig,
+  cfg: ImRouteConfig | undefined,
 ): AsyncIterable<unknown> {
-  if (cfg.unknownUser === 'fallback' && cfg.fallbackModel) {
+  if (cfg?.unknownUser === 'fallback' && cfg.fallbackModel) {
     return yield* forwardWithFailover(deps, options, buildFailoverChain(cfg.fallbackModel, []), 'unknown-fallback');
   }
   throw new Error('无法解析该会话的发送者：MRRP 尚未观测到本会话的 dsh-im 消息。请先在会话中发送一条消息，或检查「路由配置」页的未注册用户策略。');
@@ -790,11 +820,55 @@ function chunkHasContent(chunk: unknown): boolean {
   return false;
 }
 
-/** 单次转发：把 options 的 provider/model 换成目标真实模型，输出流原样透传（错误一律抛给调用方）。 */
+/** 工具名提取（兼容 OpenAI function.name / 宿主 name / tool.name）。 */
+function toolNameOf(tool: unknown): string {
+  if (!isRecord(tool)) return '';
+  const fn = isRecord(tool.function) ? tool.function : null;
+  return String(fn?.name ?? tool.name ?? tool.toolName ?? '').trim();
+}
+
+/**
+ * 按权限裁剪 tools 声明：模型看不到被禁的能力组，自然不会请求它们。
+ * 返回被裁掉的工具名（写日志与控制台用）。
+ */
+function applyToolGate(forwarded: Record<string, any>, permission: EffectivePermission): string[] {
+  const tools = Array.isArray(forwarded.tools) ? forwarded.tools : null;
+  if (!tools || !tools.length) return [];
+  const kept: unknown[] = [];
+  const dropped: string[] = [];
+  for (const tool of tools) {
+    const name = toolNameOf(tool);
+    if (!name) { kept.push(tool); continue; }
+    if (deniedToolGroup(name, permission)) { dropped.push(name); continue; }
+    kept.push(tool);
+  }
+  forwarded.tools = kept;
+  // 被裁掉的工具如果被 tool_choice 强制指定，改回 auto，避免宿主拿不存在的工具做强制选择
+  const forced = toolNameOf(forwarded.tool_choice);
+  if (forced && dropped.some((name) => name.toLowerCase() === forced.toLowerCase())) forwarded.tool_choice = 'auto';
+  return dropped;
+}
+
+/** 是否为工具调用类输出块（tool-call / tool-call-delta / tool_call 等）。 */
+function isToolCallChunk(chunk: unknown): boolean {
+  if (!isRecord(chunk)) return false;
+  const type = String(chunk.type ?? '').toLowerCase();
+  return type.includes('tool-call') || type.includes('tool_call');
+}
+
+/** 工具调用块里的工具名（增量块可能只带名字片段，取不到时返回空串）。 */
+function chunkToolName(chunk: unknown): string {
+  if (!isRecord(chunk)) return '';
+  return String(chunk.name ?? chunk.toolName ?? chunk.tool?.name ?? chunk.function?.name ?? '').trim();
+}
+
+/** 单次转发：把 options 的 provider/model 换成目标真实模型，输出流原样透传（错误一律抛给调用方）。
+ *  permission 非空时同时做工具闸门：裁掉被禁工具声明，并在输出侧丢掉被禁工具调用（宿主收不到就不会执行）。 */
 async function* forwardAttempt(
   deps: RouteAdapterDeps,
   options: Record<string, any>,
   modelKey: string,
+  permission?: EffectivePermission,
 ): AsyncIterable<unknown> {
   const parsed = parseModelKey(modelKey);
   if (!parsed) {
@@ -808,6 +882,14 @@ async function* forwardAttempt(
   // 多模态输入规范化为目标模型可识别格式（image_url），否则带图消息转发后图片失效
   normalizeMultimodalInput(forwarded);
   const session = typeof options.sessionId === 'string' ? options.sessionId : '';
+  // 工具闸门（一）：按权限裁掉 tools 声明，并把结果记进日志（便于核对「这个用户到底能看到哪些工具」）
+  let blockedTool = '';
+  if (permission) {
+    const dropped = applyToolGate(forwarded, permission);
+    if (dropped.length) {
+      routeLog(deps, { event: 'guard-tools', session, model: modelKey, dropped: dropped.slice(0, 40), kept: (forwarded.tools as unknown[]).length });
+    }
+  }
   const seenOutKinds = new Set<string>();
   const stream = deps.host.llm.stream(forwarded);
   for await (const chunk of stream) {
@@ -833,6 +915,27 @@ async function* forwardAttempt(
         routeLog(deps, { event: 'forward-media', session, model: modelKey, kind, fields: Object.keys(chunk as Record<string, any>).slice(0, 20) });
       }
     }
+    // 工具闸门（二）：被禁工具即使模型自己生成出来，也不交给宿主 —— 宿主收不到 tool-call 就不会执行。
+    if (permission) {
+      if (isToolCallChunk(chunk)) {
+        const name = chunkToolName(chunk) || blockedTool;
+        const group = name ? deniedToolGroup(name, permission) : null;
+        if (blockedTool || group) {
+          if (!blockedTool) {
+            blockedTool = name;
+            routeLog(deps, {
+              event: 'guard-deny', session, model: modelKey, kind: 'tool-call',
+              tool: name, group: group ? TOOL_GROUP_LABEL[group] : '',
+            });
+          }
+          continue; // 丢弃该工具调用的所有分片
+        }
+      } else if (blockedTool) {
+        const type = String((chunk as Record<string, any>)?.type ?? '').toLowerCase();
+        if (type.includes('block')) continue; // 被丢工具调用块的收尾块一并丢弃，避免留下空块
+        blockedTool = '';
+      }
+    }
     yield chunk;
   }
 }
@@ -852,6 +955,7 @@ async function* forwardWithFailover(
   options: Record<string, any>,
   chain: string[],
   source: string,
+  permission?: EffectivePermission,
 ): AsyncIterable<unknown> {
   const session = typeof options.sessionId === 'string' ? options.sessionId : '';
   const route = deps.getConfig()?.route;
@@ -873,7 +977,7 @@ async function* forwardWithFailover(
     }
     for (let retry = 0; retry <= retries; retry += 1) {
       try {
-        for await (const chunk of forwardAttempt(deps, options, model)) {
+        for await (const chunk of forwardAttempt(deps, options, model, permission)) {
           // 只有真的产出了内容才算「已经让用户看到」，usage / finish 之类的元数据块不该锁死容灾
           if (chunkHasContent(chunk)) emitted = true;
           yield chunk;
